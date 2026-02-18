@@ -1,6 +1,9 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import App from './App';
+import App from './App';  
+// Supports weights 200-900
+import '@fontsource-variable/mona-sans';
+import './styles/index.css';
 
 const rootElement = document.getElementById('root');
 if (!rootElement) {

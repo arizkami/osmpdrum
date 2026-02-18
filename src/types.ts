@@ -4,8 +4,9 @@ export interface PadData {
     isMuted: boolean;
     isSolo: boolean;
     isActive: boolean;
-    audioBuffer?: AudioBuffer;
-    fileName?: string;
+    filePath?: string;
+    waveformPeaks?: number[];
+    duration?: number; // seconds
 }
 
 export interface KnobProps {
@@ -15,9 +16,4 @@ export interface KnobProps {
     min?: number;
     max?: number;
     suffix?: string;
-}
-
-export interface AudioContextState {
-    context: AudioContext | null;
-    analyser: AnalyserNode | null;
 }
