@@ -1,0 +1,5 @@
+{
+  "name": "OpenSampler Drums",
+  "description": "A professional-grade React drum sampler interface featuring interactive envelope controls, a pattern grid, and waveform visualization, styled with Tailwind CSS.",
+  "requestFramePermissions": []
+}
