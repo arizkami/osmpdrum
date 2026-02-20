@@ -24,6 +24,8 @@ enum AudioCommand {
     Stop { pad_id: usize },
     Load { pad_id: usize, file_path: String },
     SetMasterVolume { volume: f32 },
+    CheckUnsavedChanges,
+    ConfirmExit,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -38,15 +40,19 @@ struct AudioBuffer {
     position: usize,
     volume: f32,
     playing: bool,
+    pad_id: usize,
+    voice_id: usize,
 }
 
 impl AudioBuffer {
-    fn new(samples: Vec<f32>, volume: f32) -> Self {
+    fn new(samples: Vec<f32>, volume: f32, pad_id: usize, voice_id: usize) -> Self {
         Self {
             samples,
             position: 0,
             volume,
             playing: true,
+            pad_id,
+            voice_id,
         }
     }
 
@@ -71,9 +77,11 @@ impl AudioBuffer {
 struct AudioEngine {
     device: Device,
     config: StreamConfig,
-    buffers: Arc<Mutex<HashMap<usize, AudioBuffer>>>,
+    buffers: Arc<Mutex<Vec<AudioBuffer>>>,
     stream: Option<Stream>,
     master_volume: Arc<Mutex<f32>>,
+    next_voice_id: Arc<Mutex<usize>>,
+    sample_cache: Arc<Mutex<HashMap<String, Vec<f32>>>>,
 }
 
 impl AudioEngine {
@@ -85,8 +93,10 @@ impl AudioEngine {
         let config = device.default_output_config()?;
         let config: StreamConfig = config.into();
         
-        let buffers: Arc<Mutex<HashMap<usize, AudioBuffer>>> = Arc::new(Mutex::new(HashMap::new()));
+        let buffers: Arc<Mutex<Vec<AudioBuffer>>> = Arc::new(Mutex::new(Vec::new()));
         let master_volume = Arc::new(Mutex::new(1.0f32));
+        let next_voice_id = Arc::new(Mutex::new(0usize));
+        let sample_cache = Arc::new(Mutex::new(HashMap::new()));
         
         Ok(Self {
             device,
@@ -94,6 +104,8 @@ impl AudioEngine {
             buffers,
             stream: None,
             master_volume,
+            next_voice_id,
+            sample_cache,
         })
     }
 
@@ -116,15 +128,21 @@ impl AudioEngine {
                     let mut mixed_sample = 0.0f32;
                     
                     // Mix all playing buffers
-                    for buffer in buffers.values_mut() {
+                    for buffer in buffers.iter_mut() {
                         mixed_sample += buffer.next_sample();
                     }
                     
-                    // Apply master volume with 2x gain boost
-                    mixed_sample *= master_vol * 2.0;
+                    // Apply master volume
+                    mixed_sample *= master_vol;
                     
-                    // Clamp to prevent distortion
-                    mixed_sample = mixed_sample.clamp(-1.0, 1.0);
+                    // Soft clipping to prevent harsh distortion
+                    mixed_sample = if mixed_sample > 1.0 {
+                        1.0 - (1.0 / (mixed_sample + 1.0))
+                    } else if mixed_sample < -1.0 {
+                        -1.0 + (1.0 / (-mixed_sample + 1.0))
+                    } else {
+                        mixed_sample
+                    };
                     
                     // Write to all channels
                     for sample in frame.iter_mut() {
@@ -133,7 +151,7 @@ impl AudioEngine {
                 }
                 
                 // Remove finished buffers
-                buffers.retain(|_, buffer| !buffer.is_finished());
+                buffers.retain(|buffer| !buffer.is_finished());
             },
             |err| eprintln!("Audio stream error: {}", err),
             None,
@@ -154,25 +172,41 @@ impl AudioEngine {
         // Ensure stream is running
         self.start_stream()?;
 
-        // Load WAV file
-        let samples = load_wav_file(file_path, self.config.sample_rate)?;
-        println!("Loaded {} samples from {}", samples.len(), file_path);
+        // Check cache first
+        let samples = {
+            let mut cache = self.sample_cache.lock().unwrap();
+            if let Some(cached) = cache.get(file_path) {
+                cached.clone()
+            } else {
+                // Load and cache
+                let loaded = load_wav_file(file_path, self.config.sample_rate)?;
+                cache.insert(file_path.to_string(), loaded.clone());
+                loaded
+            }
+        };
         
-        let buffer = AudioBuffer::new(samples, volume);
+        // Get next voice ID
+        let voice_id = {
+            let mut next_id = self.next_voice_id.lock().unwrap();
+            let id = *next_id;
+            *next_id = next_id.wrapping_add(1);
+            id
+        };
+        
+        let buffer = AudioBuffer::new(samples, volume, pad_id, voice_id);
         
         let mut buffers = self.buffers.lock().unwrap();
-        buffers.insert(pad_id, buffer);
-        println!("Playing pad {} with {} active buffers", pad_id, buffers.len());
+        buffers.push(buffer);
+        
+        println!("Playing pad {} (voice {}) with {} active voices", pad_id, voice_id, buffers.len());
         
         Ok(())
     }
 
     fn stop(&mut self, pad_id: usize) {
         let mut buffers = self.buffers.lock().unwrap();
-        if let Some(buffer) = buffers.get_mut(&pad_id) {
-            buffer.stop();
-        }
-        buffers.remove(&pad_id);
+        buffers.retain(|buffer| buffer.pad_id != pad_id);
+        println!("Stopped all voices for pad {}", pad_id);
     }
 
     fn set_master_volume(&mut self, volume: f32) {
@@ -237,6 +271,7 @@ fn load_wav_file(file_path: &str, target_sample_rate: u32) -> Result<Vec<f32>> {
 enum AppEvent {
     FileDropped { path: String, x: f64, y: f64 },
     WaveformReady(WaveformData),
+    CloseRequested,
 }
 
 struct App {
@@ -247,6 +282,7 @@ struct App {
     event_tx: Option<Sender<AppEvent>>,
     html_content: String,
     is_ready: bool,
+    pending_close: bool,
 }
 
 impl App {
@@ -265,6 +301,7 @@ impl App {
             event_tx: Some(tx),
             html_content,
             is_ready: false,
+            pending_close: false,
         })
     }
     
@@ -396,6 +433,13 @@ impl ApplicationHandler for App {
                                 let _ = tx_clone.send(AppEvent::WaveformReady(data));
                             }
                         });
+                    },
+                    AudioCommand::CheckUnsavedChanges => {
+                        // This is handled by frontend
+                    },
+                    AudioCommand::ConfirmExit => {
+                        // Exit confirmed by user
+                        std::process::exit(0);
                     }
                 }
             }
@@ -459,7 +503,10 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                event_loop.exit();
+                // Don't close immediately, send event to check for unsaved changes
+                if let Some(tx) = &self.event_tx {
+                    let _ = tx.send(AppEvent::CloseRequested);
+                }
             }
             _ => (),
         }
@@ -488,6 +535,22 @@ impl ApplicationHandler for App {
                             if let Some(webview) = &self.webview {
                                 let _ = webview.evaluate_script(&js);
                             }
+                        }
+                    },
+                    AppEvent::CloseRequested => {
+                        // Check for unsaved changes and show dialog if needed
+                        if let Some(webview) = &self.webview {
+                            let js = r#"
+                                (function() {
+                                    const hasChanges = window.__hasUnsavedChanges || false;
+                                    if (hasChanges && window.__showExitDialog) {
+                                        window.__showExitDialog();
+                                    } else {
+                                        window.ipc.postMessage(JSON.stringify({ command: 'ConfirmExit' }));
+                                    }
+                                })();
+                            "#;
+                            let _ = webview.evaluate_script(js);
                         }
                     }
                 }

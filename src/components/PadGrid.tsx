@@ -11,13 +11,56 @@ interface PadGridProps {
     onFileLoadToPad?: (padId: number, buffer: any, fileName: string) => void;
 }
 
-export const PadGrid: React.FC<PadGridProps> = ({ pads, onSelect, onToggle, onPlay }) => {
+export const PadGrid: React.FC<PadGridProps> = ({ pads, onSelect, onToggle, onPlay, onFileLoadToPad }) => {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; padId: number } | null>(null);
+    const [dragOverPadId, setDragOverPadId] = useState<number | null>(null);
 
     const handlePadClick = (id: number) => {
         onSelect(id);
         if (onPlay) {
             onPlay(id);
+        }
+    };
+
+    const handleDrop = async (e: React.DragEvent, padId: number) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setDragOverPadId(null);
+
+        const files = Array.from(e.dataTransfer.files);
+        const audioFile = files.find(f => 
+            f.type.startsWith('audio/') || 
+            f.name.endsWith('.wav') || 
+            f.name.endsWith('.mp3') || 
+            f.name.endsWith('.ogg')
+        );
+
+        if (audioFile && onFileLoadToPad) {
+            try {
+                const arrayBuffer = await audioFile.arrayBuffer();
+                const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
+                const audioContext = new AudioContextClass();
+                const buffer = await audioContext.decodeAudioData(arrayBuffer);
+                onFileLoadToPad(padId, buffer, audioFile.name);
+            } catch (error) {
+                console.error('Error loading audio file:', error);
+                alert('Failed to load audio file. Make sure it\'s a valid audio format.');
+            }
+        }
+    };
+
+    const handleDragOver = (e: React.DragEvent, padId: number) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setDragOverPadId(padId);
+    };
+
+    const handleDragLeave = (e: React.DragEvent, padId: number) => {
+        e.preventDefault();
+        e.stopPropagation();
+        // Only clear if we're actually leaving this pad
+        if (dragOverPadId === padId) {
+            setDragOverPadId(null);
         }
     };
 
@@ -62,6 +105,9 @@ export const PadGrid: React.FC<PadGridProps> = ({ pads, onSelect, onToggle, onPl
                         data-pad-id={pad.id}
                         onClick={() => handlePadClick(pad.id)}
                         onContextMenu={(e) => handleContextMenu(e, pad.id)}
+                        onDrop={(e) => handleDrop(e, pad.id)}
+                        onDragOver={(e) => handleDragOver(e, pad.id)}
+                        onDragLeave={(e) => handleDragLeave(e, pad.id)}
                         className={`
                             relative transition-all cursor-pointer group overflow-hidden
                             ${pad.isActive
@@ -69,6 +115,7 @@ export const PadGrid: React.FC<PadGridProps> = ({ pads, onSelect, onToggle, onPl
                                 : 'bg-gradient-to-br from-[#151515] to-[#0d0d0d] hover:from-[#1a1a1a] hover:to-[#121212]'
                             }
                             ${pad.waveformPeaks ? 'ring-1 ring-inset ring-green-500/20' : ''}
+                            ${dragOverPadId === pad.id ? 'ring-2 ring-inset ring-cyan-400 bg-cyan-500/10 shadow-lg shadow-cyan-500/30' : ''}
                         `}
                     >
                         {/* Subtle grid pattern */}

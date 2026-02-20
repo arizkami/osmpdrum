@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite build && cargo run --manifest-path host/Cargo.toml"
   },
   "dependencies": {
     "@fontsource-variable/mona-sans": "^5.2.8",

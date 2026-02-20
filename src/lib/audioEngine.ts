@@ -33,6 +33,10 @@ export class AudioEngine {
     public setMasterVolume(volume: number) {
         this.send('SetMasterVolume', { volume });
     }
+
+    public confirmExit() {
+        this.send('ConfirmExit', {});
+    }
 }
 
 export const audioEngine = new AudioEngine();

@@ -6,13 +6,29 @@ interface WaveformProps {
     peaks?: number[];
     isPlaying?: boolean;
     playProgress?: number;
+    startPoint?: number; // 0-1 range
+    endPoint?: number; // 0-1 range
+    onStartPointChange?: (value: number) => void;
+    onEndPointChange?: (value: number) => void;
 }
 
-export const WaveformDisplay: React.FC<WaveformProps> = ({ color, peaks, isPlaying = false, playProgress = 0 }) => {
+export const WaveformDisplay: React.FC<WaveformProps> = ({ 
+    color, 
+    peaks, 
+    isPlaying = false, 
+    playProgress = 0,
+    startPoint = 0,
+    endPoint = 1,
+    onStartPointChange,
+    onEndPointChange
+}) => {
     const svgRef = useRef<SVGSVGElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const playheadRef = useRef<SVGLineElement>(null);
+    const startMarkerRef = useRef<SVGGElement>(null);
+    const endMarkerRef = useRef<SVGGElement>(null);
     const [dimensions, setDimensions] = useState({ width: 800, height: 96 });
+    const [draggingMarker, setDraggingMarker] = useState<'start' | 'end' | null>(null);
 
     useEffect(() => {
         const updateDimensions = () => {
@@ -96,6 +112,48 @@ export const WaveformDisplay: React.FC<WaveformProps> = ({ color, peaks, isPlayi
 
         playheadRef.current = playhead.node();
 
+        // Start marker
+        const startMarker = svg.append('g')
+            .attr('class', 'start-marker')
+            .attr('cursor', 'ew-resize');
+
+        startMarker.append('line')
+            .attr('x1', 0)
+            .attr('x2', 0)
+            .attr('y1', 0)
+            .attr('y2', height)
+            .attr('stroke', '#00ff00')
+            .attr('stroke-width', 2)
+            .attr('opacity', 0.8);
+
+        startMarker.append('polygon')
+            .attr('points', '0,0 8,0 8,12 4,16 0,12')
+            .attr('fill', '#00ff00')
+            .attr('opacity', 0.9);
+
+        startMarkerRef.current = startMarker.node();
+
+        // End marker
+        const endMarker = svg.append('g')
+            .attr('class', 'end-marker')
+            .attr('cursor', 'ew-resize');
+
+        endMarker.append('line')
+            .attr('x1', 0)
+            .attr('x2', 0)
+            .attr('y1', 0)
+            .attr('y2', height)
+            .attr('stroke', '#ff6600')
+            .attr('stroke-width', 2)
+            .attr('opacity', 0.8);
+
+        endMarker.append('polygon')
+            .attr('points', '0,0 8,0 8,12 4,16 0,12')
+            .attr('fill', '#ff6600')
+            .attr('opacity', 0.9);
+
+        endMarkerRef.current = endMarker.node();
+
     }, [peaks, dimensions]);
 
     useEffect(() => {
@@ -107,6 +165,56 @@ export const WaveformDisplay: React.FC<WaveformProps> = ({ color, peaks, isPlayi
                 .attr('opacity', isPlaying ? 1 : 0);
         }
     }, [playProgress, isPlaying, dimensions.width]);
+
+    // Update marker positions
+    useEffect(() => {
+        if (startMarkerRef.current && dimensions.width > 0) {
+            const x = startPoint * dimensions.width;
+            d3.select(startMarkerRef.current)
+                .attr('transform', `translate(${x}, 0)`);
+        }
+        if (endMarkerRef.current && dimensions.width > 0) {
+            const x = endPoint * dimensions.width;
+            d3.select(endMarkerRef.current)
+                .attr('transform', `translate(${x}, 0)`);
+        }
+    }, [startPoint, endPoint, dimensions.width]);
+
+    // Handle marker dragging
+    useEffect(() => {
+        const handleMouseMove = (e: MouseEvent) => {
+            if (!draggingMarker || !containerRef.current) return;
+
+            const rect = containerRef.current.getBoundingClientRect();
+            const x = e.clientX - rect.left - 16; // Account for padding
+            const normalizedX = Math.max(0, Math.min(1, x / (rect.width - 32)));
+
+            if (draggingMarker === 'start' && onStartPointChange) {
+                onStartPointChange(Math.min(normalizedX, endPoint - 0.01));
+            } else if (draggingMarker === 'end' && onEndPointChange) {
+                onEndPointChange(Math.max(normalizedX, startPoint + 0.01));
+            }
+        };
+
+        const handleMouseUp = () => {
+            setDraggingMarker(null);
+        };
+
+        if (draggingMarker) {
+            window.addEventListener('mousemove', handleMouseMove);
+            window.addEventListener('mouseup', handleMouseUp);
+            return () => {
+                window.removeEventListener('mousemove', handleMouseMove);
+                window.removeEventListener('mouseup', handleMouseUp);
+            };
+        }
+    }, [draggingMarker, startPoint, endPoint, onStartPointChange, onEndPointChange]);
+
+    const handleMarkerMouseDown = (marker: 'start' | 'end') => (e: React.MouseEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setDraggingMarker(marker);
+    };
 
     return (
         <div
@@ -134,6 +242,14 @@ export const WaveformDisplay: React.FC<WaveformProps> = ({ color, peaks, isPlayi
                 width={dimensions.width}
                 height={dimensions.height}
                 preserveAspectRatio="none"
+                onMouseDown={(e) => {
+                    const target = e.target as SVGElement;
+                    if (target.closest('.start-marker')) {
+                        handleMarkerMouseDown('start')(e);
+                    } else if (target.closest('.end-marker')) {
+                        handleMarkerMouseDown('end')(e);
+                    }
+                }}
             />
         </div>
     );

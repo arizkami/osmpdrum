@@ -7,6 +7,9 @@ export interface PadData {
     filePath?: string;
     waveformPeaks?: number[];
     duration?: number; // seconds
+    audioBuffer?: AudioBuffer; // For browser-based playback
+    startPoint?: number; // 0-1 range
+    endPoint?: number; // 0-1 range
 }
 
 export interface KnobProps {
