@@ -5,6 +5,9 @@ import { Knob } from './components/Knob';
 import { PadGrid } from './components/PadGrid';
 import { EffectsRack } from './components/EffectsRack';
 import { Dialog, DialogFooter, DialogButton } from './components/Dialog';
+import { DropdownMenu } from './components/DropdownMenu';
+import { MenuSelect } from './components/MenuSelect';
+import { VUMeter } from './components/VUMeter';
 import { PadData } from './types';
 import { audioEngine } from './lib/audioEngine';
 
@@ -16,10 +19,122 @@ const App: React.FC = () => {
   const [isPlaying, setIsPlaying] = useState(false);
   const [playProgress, setPlayProgress] = useState(0);
   const [masterVolume, setMasterVolume] = useState(100);
+  const [playbackLatencyMs, setPlaybackLatencyMs] = useState(50);
+  const [showAudioSettings, setShowAudioSettings] = useState(false);
+  const [audioBackends, setAudioBackends] = useState<string[]>([]);
+  const [selectedBackend, setSelectedBackend] = useState<string>('');
+  const [audioDevices, setAudioDevices] = useState<string[]>([]);
+  const [selectedDevice, setSelectedDevice] = useState<string>('');
+  const [bufferSizeFrames, setBufferSizeFrames] = useState(0);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [showExitDialog, setShowExitDialog] = useState(false);
+  const [vuLevel, setVuLevel] = useState(0);
   const animationFrameRef = useRef<number>(0);
   const playStartTimeRef = useRef<number>(0);
+
+  const safeGetLocalStorageNumber = (key: string): number | undefined => {
+    try {
+      const stored = window.localStorage.getItem(key);
+      if (stored == null) return undefined;
+      const parsed = Number(stored);
+      return Number.isFinite(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const safeSetLocalStorage = (key: string, value: string) => {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch {
+      // Ignore: localStorage may be blocked in Wry/about:blank origin.
+    }
+  };
+
+  useEffect(() => {
+    const initial = safeGetLocalStorageNumber('osmpdrum.playbackLatencyMs') ?? 50;
+    const clamped = Math.max(5, Math.min(500, Math.round(initial)));
+    setPlaybackLatencyMs(clamped);
+    audioEngine.setPlaybackLatency(clamped);
+  }, []);
+
+  const openAudioSettings = () => {
+    setShowAudioSettings(true);
+    audioEngine.getAudioSettings();
+    audioEngine.getAudioBackends();
+    if (selectedBackend) {
+      audioEngine.getAudioDevices(selectedBackend);
+    }
+  };
+
+  const applyBackend = (backend: string) => {
+    setSelectedBackend(backend);
+    setSelectedDevice('');
+    setAudioDevices([]);
+    audioEngine.setPlaybackBackend(backend);
+    audioEngine.getAudioDevices(backend);
+  };
+
+  const applyDevice = (deviceName: string) => {
+    setSelectedDevice(deviceName);
+    audioEngine.setPlaybackDevice(deviceName);
+  };
+
+  const applyBufferFrames = (frames: number) => {
+    const clamped = Math.max(0, Math.min(8192, Math.round(frames)));
+    setBufferSizeFrames(clamped);
+    audioEngine.setBufferSizeFrames(clamped);
+  };
+
+  useEffect(() => {
+    const handleOpen = () => {
+      openAudioSettings();
+    };
+
+    const handleBackends = (e: CustomEvent) => {
+      const listRaw = Array.isArray(e.detail) ? (e.detail as any[]).filter(x => typeof x === 'string') as string[] : [];
+      const list = listRaw.filter(x => x === 'WASAPI' || x === 'KS');
+      setAudioBackends(list);
+      if (!selectedBackend && list.length > 0) {
+        setSelectedBackend(list[0]);
+        audioEngine.getAudioDevices(list[0]);
+      }
+    };
+
+    const handleDevices = (e: CustomEvent) => {
+      const listRaw = Array.isArray(e.detail) ? (e.detail as any[]).filter(x => typeof x === 'string') as string[] : [];
+      setAudioDevices(listRaw);
+      if (!selectedDevice && listRaw.length > 0) {
+        setSelectedDevice(listRaw[0]);
+      }
+    };
+
+    const handleSettings = (e: CustomEvent) => {
+      const s = (e.detail ?? {}) as any;
+      const frames = typeof s.buffer_size_frames === 'number' ? s.buffer_size_frames : 0;
+      setBufferSizeFrames(Number.isFinite(frames) ? frames : 0);
+    };
+
+    window.addEventListener('rust-open-audio-settings', handleOpen as any);
+    window.addEventListener('rust-audio-backends', handleBackends as any);
+    window.addEventListener('rust-audio-devices', handleDevices as any);
+    window.addEventListener('rust-audio-settings', handleSettings as any);
+    return () => {
+      window.removeEventListener('rust-open-audio-settings', handleOpen as any);
+      window.removeEventListener('rust-audio-backends', handleBackends as any);
+      window.removeEventListener('rust-audio-devices', handleDevices as any);
+      window.removeEventListener('rust-audio-settings', handleSettings as any);
+    };
+  }, [selectedBackend, selectedDevice]);
+
+  useEffect(() => {
+    if (!showAudioSettings) return;
+    audioEngine.getAudioSettings();
+    audioEngine.getAudioBackends();
+    if (selectedBackend) {
+      audioEngine.getAudioDevices(selectedBackend);
+    }
+  }, [showAudioSettings, selectedBackend]);
 
   // Mock data for pads
   const [pads, setPads] = useState<PadData[]>(
@@ -78,6 +193,13 @@ const App: React.FC = () => {
   const handleMasterVolumeChange = (value: number) => {
     setMasterVolume(value);
     audioEngine.setMasterVolume(value / 100);
+  };
+
+  const handlePlaybackLatencyChange = (value: number) => {
+    const clamped = Math.max(5, Math.min(500, Math.round(value)));
+    setPlaybackLatencyMs(clamped);
+    safeSetLocalStorage('osmpdrum.playbackLatencyMs', String(clamped));
+    audioEngine.setPlaybackLatency(clamped);
   };
 
   // Listen for Rust events
@@ -228,6 +350,8 @@ const App: React.FC = () => {
     const pad = pads[padId];
     if (!pad.filePath || pad.isMuted) return;
 
+    setVuLevel(prev => Math.min(1, Math.max(prev, 0.85)));
+
     // Trigger backend
     audioEngine.play(padId, pad.filePath, 1.0, 0.0);
 
@@ -281,6 +405,16 @@ const App: React.FC = () => {
 
   const selectedPad = pads[selectedPadId];
 
+  useEffect(() => {
+    let raf = 0;
+    const tick = () => {
+      setVuLevel(v => Math.max(0, v * 0.92));
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
   // Debug: log dialog state
   useEffect(() => {
     console.log('showExitDialog state:', showExitDialog);
@@ -293,11 +427,55 @@ const App: React.FC = () => {
         <div className="font-extrabold tracking-tight mr-8 text-base flex items-center">
           <img src={Logo} alt="" />
         </div>
-        <nav className="flex gap-5 text-xs font-semibold text-text-muted">
-          <button className="hover:text-text-main transition-colors focus:outline-none">FILE</button>
-          <button className="hover:text-text-main transition-colors focus:outline-none">EDIT</button>
-          <button className="hover:text-text-main transition-colors focus:outline-none">TOOL</button>
-          <button className="hover:text-text-main transition-colors focus:outline-none">HELP</button>
+        <nav className="flex gap-5 text-xs font-semibold text-text-muted flex items-center">
+          <DropdownMenu
+            label="FILE"
+            items={[
+              {
+                label: 'Audio Settings...',
+                onClick: () => openAudioSettings(),
+                icon: <FileAudio size={14} />,
+              },
+              { divider: true } as any,
+              {
+                label: 'Exit',
+                onClick: () => setShowExitDialog(true),
+              },
+            ]}
+          />
+          <DropdownMenu
+            label="EDIT"
+            items={[
+              {
+                label: 'Preferences',
+                onClick: () => {},
+                icon: <Settings size={14} />,
+                disabled: true,
+              },
+            ]}
+          />
+          <DropdownMenu
+            label="TOOL"
+            items={[
+              {
+                label: 'Open Mixer',
+                onClick: () => {},
+                icon: <Layout size={14} />,
+                disabled: true,
+              },
+            ]}
+          />
+          <DropdownMenu
+            label="HELP"
+            items={[
+              {
+                label: 'About',
+                onClick: () => {},
+                icon: <HelpCircle size={14} />,
+                disabled: true,
+              },
+            ]}
+          />
           <button 
             onClick={() => setShowExitDialog(true)} 
             className="ml-4 px-2 py-1 bg-red-600 text-white text-xs rounded hover:bg-red-700"
@@ -402,13 +580,17 @@ const App: React.FC = () => {
             </div>
 
             {/* Master Volume Section */}
-            <div className="w-32 bg-panel-bg flex flex-col shrink-0">
+            <div className="w-64 bg-panel-bg flex flex-col shrink-0">
               <div className="bg-header-bg text-text-muted text-[10px] h-7 font-bold px-2 py-1 border-b border-border-dark uppercase tracking-wider">
                 Master
               </div>
-              <div className="flex items-center justify-center flex-1 px-2 pb-2">
+              <div className="flex items-center justify-around flex-1 px-2 pb-2">
+                <div className="flex flex-col items-center gap-1">
+                  <VUMeter level={vuLevel} width={54} height={54} />
+                  <span className="text-[11px] font-medium text-text-muted">VU</span>
+                </div>
                 <Knob
-                  label="Volume"
+                  label="Master"
                   value={masterVolume}
                   onChange={handleMasterVolumeChange}
                   suffix="%"
@@ -450,6 +632,64 @@ const App: React.FC = () => {
             Exit Without Saving
           </DialogButton>
         </DialogFooter>
+      </Dialog>
+
+      <Dialog
+        isOpen={showAudioSettings}
+        onClose={() => setShowAudioSettings(false)}
+        title="Audio Settings"
+        size="md"
+      >
+        <div className="space-y-4">
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">
+              Playback API
+            </div>
+            <MenuSelect
+              value={selectedBackend}
+              placeholder="(No backends reported)"
+              items={audioBackends.map(b => ({ label: b, value: b }))}
+              onChange={(v) => applyBackend(v)}
+            />
+          </div>
+
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">
+              Output Device
+            </div>
+            <MenuSelect
+              value={selectedDevice}
+              placeholder="(No devices reported)"
+              items={audioDevices.map(d => ({ label: d, value: d }))}
+              onChange={(v) => applyDevice(v)}
+            />
+          </div>
+
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">
+              Buffer size (frames)
+            </div>
+            <MenuSelect
+              value={String(bufferSizeFrames)}
+              placeholder="Auto"
+              items={[
+                { label: 'Auto', value: '0' },
+                { label: '64', value: '64' },
+                { label: '128', value: '128' },
+                { label: '256', value: '256' },
+                { label: '512', value: '512' },
+                { label: '1024', value: '1024' },
+                { label: '2048', value: '2048' },
+                { label: '4096', value: '4096' },
+                { label: '8192', value: '8192' },
+              ]}
+              onChange={(v) => applyBufferFrames(Number(v))}
+            />
+            <div className="mt-2 text-[11px] text-text-muted leading-relaxed">
+              Set to 0 for auto (uses latency). Setting an explicit frame size overrides latency.
+            </div>
+          </div>
+        </div>
       </Dialog>
     </div>
   );

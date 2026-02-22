@@ -1,7 +1,19 @@
 
 // Interface for the IPC messages
 interface AudioCommand {
-    command: 'Play' | 'Stop' | 'Load';
+    command:
+        | 'Play'
+        | 'Stop'
+        | 'Load'
+        | 'SetMasterVolume'
+        | 'SetPlaybackLatency'
+        | 'GetAudioSettings'
+        | 'GetAudioBackends'
+        | 'GetAudioDevices'
+        | 'SetPlaybackBackend'
+        | 'SetPlaybackDevice'
+        | 'SetBufferSizeFrames'
+        | 'ConfirmExit';
     payload: any;
 }
 
@@ -32,6 +44,34 @@ export class AudioEngine {
 
     public setMasterVolume(volume: number) {
         this.send('SetMasterVolume', { volume });
+    }
+
+    public setPlaybackLatency(latencyMs: number) {
+        this.send('SetPlaybackLatency', { latency_ms: latencyMs });
+    }
+
+    public getAudioBackends() {
+        this.send('GetAudioBackends', {});
+    }
+
+    public getAudioSettings() {
+        this.send('GetAudioSettings', {});
+    }
+
+    public getAudioDevices(backend: string) {
+        this.send('GetAudioDevices', { backend });
+    }
+
+    public setPlaybackBackend(backend: string) {
+        this.send('SetPlaybackBackend', { backend });
+    }
+
+    public setPlaybackDevice(deviceName: string) {
+        this.send('SetPlaybackDevice', { device_name: deviceName });
+    }
+
+    public setBufferSizeFrames(frames: number) {
+        this.send('SetBufferSizeFrames', { frames });
     }
 
     public confirmExit() {
