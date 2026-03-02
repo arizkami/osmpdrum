@@ -13,7 +13,14 @@ interface AudioCommand {
         | 'SetPlaybackBackend'
         | 'SetPlaybackDevice'
         | 'SetBufferSizeFrames'
-        | 'ConfirmExit';
+        | 'ConfirmExit'
+        | 'ListDirectory'
+        | 'GetPresets'
+        | 'GetLibrary'
+        | 'GetMidiInputs'
+        | 'SetMidiInput'
+        | 'SetWasapiExclusive'
+        | 'SetSampleRate';
     payload: any;
 }
 
@@ -76,6 +83,34 @@ export class AudioEngine {
 
     public confirmExit() {
         this.send('ConfirmExit', {});
+    }
+
+    public listDirectory(path?: string) {
+        this.send('ListDirectory', { path: path ?? null });
+    }
+
+    public getPresets() {
+        this.send('GetPresets', {});
+    }
+
+    public getLibrary() {
+        this.send('GetLibrary', {});
+    }
+
+    public getMidiInputs() {
+        this.send('GetMidiInputs', {});
+    }
+
+    public setMidiInput(portName: string | null) {
+        this.send('SetMidiInput', { port_name: portName });
+    }
+
+    public setWasapiExclusive(exclusive: boolean) {
+        this.send('SetWasapiExclusive', { exclusive });
+    }
+
+    public setSampleRate(rate: number) {
+        this.send('SetSampleRate', { rate });
     }
 }
 

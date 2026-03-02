@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Layout, Music, Settings, HelpCircle, FileAudio, Folder } from 'lucide-react';
+import { Layout, Music, Settings, HelpCircle, FileAudio } from 'lucide-react';
 import { WaveformDisplay } from './components/WaveformDisplay';
 import { Knob } from './components/Knob';
 import { PadGrid } from './components/PadGrid';
@@ -8,6 +8,7 @@ import { Dialog, DialogFooter, DialogButton } from './components/Dialog';
 import { DropdownMenu } from './components/DropdownMenu';
 import { MenuSelect } from './components/MenuSelect';
 import { VUMeter } from './components/VUMeter';
+import { Sidebar } from './components/Sidebar';
 import { PadData } from './types';
 import { audioEngine } from './lib/audioEngine';
 
@@ -26,6 +27,10 @@ const App: React.FC = () => {
   const [audioDevices, setAudioDevices] = useState<string[]>([]);
   const [selectedDevice, setSelectedDevice] = useState<string>('');
   const [bufferSizeFrames, setBufferSizeFrames] = useState(0);
+  const [midiInputPorts, setMidiInputPorts] = useState<string[]>([]);
+  const [selectedMidiInput, setSelectedMidiInput] = useState<string>('');
+  const [wasapiExclusive, setWasapiExclusive] = useState(false);
+  const [sampleRate, setSampleRate] = useState(0);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [showExitDialog, setShowExitDialog] = useState(false);
   const [vuLevel, setVuLevel] = useState(0);
@@ -62,9 +67,15 @@ const App: React.FC = () => {
     setShowAudioSettings(true);
     audioEngine.getAudioSettings();
     audioEngine.getAudioBackends();
+    audioEngine.getMidiInputs();
     if (selectedBackend) {
       audioEngine.getAudioDevices(selectedBackend);
     }
+  };
+
+  const applyMidiInput = (portName: string) => {
+    setSelectedMidiInput(portName);
+    audioEngine.setMidiInput(portName || null);
   };
 
   const applyBackend = (backend: string) => {
@@ -84,6 +95,16 @@ const App: React.FC = () => {
     const clamped = Math.max(0, Math.min(8192, Math.round(frames)));
     setBufferSizeFrames(clamped);
     audioEngine.setBufferSizeFrames(clamped);
+  };
+
+  const applyWasapiExclusive = (exclusive: boolean) => {
+    setWasapiExclusive(exclusive);
+    audioEngine.setWasapiExclusive(exclusive);
+  };
+
+  const applySampleRate = (rate: number) => {
+    setSampleRate(rate);
+    audioEngine.setSampleRate(rate);
   };
 
   useEffect(() => {
@@ -113,17 +134,33 @@ const App: React.FC = () => {
       const s = (e.detail ?? {}) as any;
       const frames = typeof s.buffer_size_frames === 'number' ? s.buffer_size_frames : 0;
       setBufferSizeFrames(Number.isFinite(frames) ? frames : 0);
+      if (typeof s.midi_input_port === 'string' && s.midi_input_port) {
+        setSelectedMidiInput(s.midi_input_port);
+      }
+      if (typeof s.wasapi_exclusive === 'boolean') {
+        setWasapiExclusive(s.wasapi_exclusive);
+      }
+      if (typeof s.sample_rate === 'number' && s.sample_rate > 0) {
+        setSampleRate(s.sample_rate);
+      }
+    };
+
+    const handleMidiInputs = (e: CustomEvent) => {
+      const ports = Array.isArray(e.detail) ? (e.detail as string[]) : [];
+      setMidiInputPorts(ports);
     };
 
     window.addEventListener('rust-open-audio-settings', handleOpen as any);
     window.addEventListener('rust-audio-backends', handleBackends as any);
     window.addEventListener('rust-audio-devices', handleDevices as any);
     window.addEventListener('rust-audio-settings', handleSettings as any);
+    window.addEventListener('rust-midi-inputs', handleMidiInputs as any);
     return () => {
       window.removeEventListener('rust-open-audio-settings', handleOpen as any);
       window.removeEventListener('rust-audio-backends', handleBackends as any);
       window.removeEventListener('rust-audio-devices', handleDevices as any);
       window.removeEventListener('rust-audio-settings', handleSettings as any);
+      window.removeEventListener('rust-midi-inputs', handleMidiInputs as any);
     };
   }, [selectedBackend, selectedDevice]);
 
@@ -131,6 +168,7 @@ const App: React.FC = () => {
     if (!showAudioSettings) return;
     audioEngine.getAudioSettings();
     audioEngine.getAudioBackends();
+    audioEngine.getMidiInputs();
     if (selectedBackend) {
       audioEngine.getAudioDevices(selectedBackend);
     }
@@ -244,14 +282,24 @@ const App: React.FC = () => {
       }));
     };
 
+    const handleMidiNote = (e: CustomEvent) => {
+      const { note } = e.detail as { note: number; velocity: number; channel: number };
+      const padId = note - 36;
+      if (padId >= 0 && padId < 32) {
+        playPad(padId);
+      }
+    };
+
     window.addEventListener('rust-file-drop', handleDrop as any);
     window.addEventListener('rust-waveform-ready', handleWaveformReady as any);
+    window.addEventListener('rust-midi-note', handleMidiNote as any);
 
     return () => {
       window.removeEventListener('rust-file-drop', handleDrop as any);
       window.removeEventListener('rust-waveform-ready', handleWaveformReady as any);
+      window.removeEventListener('rust-midi-note', handleMidiNote as any);
     };
-  }, [selectedPadId]);
+  }, [selectedPadId, pads]);
 
   const handlePadSelect = (id: number) => {
     setSelectedPadId(id);
@@ -281,6 +329,69 @@ const App: React.FC = () => {
       }
       return p;
     }));
+    setHasUnsavedChanges(true);
+  };
+
+  const handleSidebarFileSelect = (path: string) => {
+    const name = path.split(/[\\/]/).pop() || 'SAMPLE';
+    const cleanName = name.replace(/\.(wav|mp3|flac|ogg|aiff)$/i, '');
+    setPads(prev => prev.map(p => {
+      if (p.id === selectedPadId) {
+        return { ...p, filePath: path, label: cleanName.substring(0, 8).toUpperCase() };
+      }
+      return p;
+    }));
+    audioEngine.load(selectedPadId, path);
+    setHasUnsavedChanges(true);
+  };
+
+  const handleSwapPads = (fromId: number, toId: number) => {
+    setPads(prev => {
+      const fromPad = prev[fromId];
+      const toPad   = prev[toId];
+      setTimeout(() => {
+        if (toPad.filePath)  audioEngine.load(fromId, toPad.filePath);
+        if (fromPad.filePath) audioEngine.load(toId, fromPad.filePath);
+      }, 0);
+      return prev.map(p => {
+        if (p.id === fromId) return { ...toPad,  id: fromId, isActive: p.isActive };
+        if (p.id === toId)   return { ...fromPad, id: toId,   isActive: p.isActive };
+        return p;
+      });
+    });
+    setHasUnsavedChanges(true);
+  };
+
+  const handleCopyPadTo = (fromId: number, toId: number) => {
+    setPads(prev => {
+      const fromPad = prev[fromId];
+      setTimeout(() => {
+        if (fromPad.filePath) audioEngine.load(toId, fromPad.filePath);
+      }, 0);
+      return prev.map(p => {
+        if (p.id !== toId) return p;
+        return { ...fromPad, id: toId, isActive: p.isActive };
+      });
+    });
+    setHasUnsavedChanges(true);
+  };
+
+  const handleClearPad = (padId: number) => {
+    setPads(prev => prev.map(p => {
+      if (p.id !== padId) return p;
+      return { ...p, filePath: undefined, label: '', waveformPeaks: undefined, duration: 0, audioBuffer: undefined, startPoint: 0, endPoint: 1 };
+    }));
+    setHasUnsavedChanges(true);
+  };
+
+  const handlePathDrop = (padId: number, path: string) => {
+    const name = path.split(/[\\/]/).pop() || 'SAMPLE';
+    const cleanName = name.replace(/\.(wav|mp3|flac|ogg|aiff)$/i, '');
+    setPads(prev => prev.map(p => {
+      if (p.id !== padId) return p;
+      return { ...p, filePath: path, label: cleanName.substring(0, 8).toUpperCase() };
+    }));
+    audioEngine.load(padId, path);
     setHasUnsavedChanges(true);
   };
 
@@ -476,42 +587,22 @@ const App: React.FC = () => {
               },
             ]}
           />
-          <button 
-            onClick={() => setShowExitDialog(true)} 
-            className="ml-4 px-2 py-1 bg-red-600 text-white text-xs rounded hover:bg-red-700"
-          >
-            Test Dialog
-          </button>
         </nav>
       </header>
 
       <div className="flex flex-1 overflow-hidden">
 
-        {/* Sidebar */}
-        <aside className="w-64 bg-panel-bg border-r border-border-dark flex flex-col shrink-0">
-          <div className="px-3 py-2 text-xs text-text-muted bg-header-bg border-b border-border-dark font-semibold uppercase tracking-wider">
-            File Browser
-          </div>
-          <div className="p-3 text-xs text-text-muted space-y-1 overflow-y-auto flex-1">
-            <div className="flex items-center gap-2 cursor-pointer hover:text-text-main transition-colors">
-              <Folder size={14} className="text-gray-500" />
-              <span>Drums_Vol_1</span>
-            </div>
-            <div className="px-4 py-2 text-gray-600 italic">
-              Drag files directly from OS into the window
-            </div>
-          </div>
-        </aside>
+        <Sidebar onFileSelect={handleSidebarFileSelect} />
 
         {/* Main Content */}
         <main className="flex-1 flex flex-col bg-app-bg min-w-0">
 
           {/* Top Control Panel */}
-          <div className="h-control-h border-border-dark flex shrink-0">
+          <div className="h-control-h border-border-dark flex shrink-0 border-b border-[#1e1e1e]">
 
             {/* Waveform Section */}
-            <div className="flex-1 flex flex-col border-r border-border-dark min-w-0 relative group">
-              <div className="absolute top-0 left-0 bg-accent-cyan text-black px-2.5 py-1 text-xs font-bold z-10">
+            <div className="flex-1 flex flex-col border-r border-[#1e1e1e] min-w-0 relative group">
+              <div className="absolute top-0 left-0 bg-accent-cyan text-black px-2.5 py-0.5 text-[10px] font-bold z-10 tracking-wider uppercase">
                 {selectedPad?.label || 'EMPTY_SLOT'}
               </div>
               <WaveformDisplay
@@ -524,19 +615,19 @@ const App: React.FC = () => {
                 onStartPointChange={handleStartPointChange}
                 onEndPointChange={handleEndPointChange}
               />
-              <div className="flex justify-between text-[10px] text-text-main px-2 py-0.5 border-t border-border-dark bg-header-bg">
-                <span className="font-mono opacity-70">
+              <div className="flex justify-between text-[10px] text-text-main px-2.5 py-1 border-t border-[#1e1e1e] bg-[#0f0f0f]">
+                <span className="font-mono text-gray-600 text-[9px] uppercase tracking-wider">
                   Start: 000000 ms
                 </span>
-                <span className="font-mono opacity-70">
+                <span className="font-mono text-gray-500 text-[9px]">
                   Duration: {selectedPad?.duration ? selectedPad.duration.toFixed(3) : '0.000'} s
                 </span>
               </div>
             </div>
 
             {/* Envelope Section */}
-            <div className="w-96 bg-panel-bg border-r border-border-dark flex flex-col shrink-0">
-              <div className="bg-header-bg text-text-muted text-[10px] h-7 font-bold px-2 py-1 border-b border-border-dark uppercase tracking-wider">
+            <div className="w-80 bg-panel-bg border-r border-[#1e1e1e] flex flex-col shrink-0">
+              <div className="bg-[#161616] text-text-muted text-[10px] h-7 font-bold px-2.5 py-1 border-b border-[#1e1e1e] uppercase tracking-widest flex items-center">
                 Envelope Generator
               </div>
 
@@ -563,31 +654,34 @@ const App: React.FC = () => {
             </div>
 
             {/* Options Section */}
-            <div className="w-52 bg-panel-bg border-r border-border-dark text-xs flex flex-col shrink-0">
-              <div className="bg-header-bg text-text-muted text-[10px] h-7 font-bold px-2 py-1 border-b border-border-dark uppercase tracking-wider">
+            <div className="w-48 bg-panel-bg border-r border-[#1e1e1e] text-xs flex flex-col shrink-0">
+              <div className="bg-[#161616] text-text-muted text-[10px] h-7 font-bold px-2.5 py-1 border-b border-[#1e1e1e] uppercase tracking-widest flex items-center">
                 Sample Properties
               </div>
-              <div className="p-3 space-y-2">
-                <div className="flex justify-between items-center">
-                  <span className="text-text-muted">Root Note</span>
-                  <span className="text-accent-cyan font-mono bg-black/30 px-1 rounded">C3</span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-text-muted">Tune</span>
-                  <span className="text-accent-cyan font-mono bg-black/30 px-1 rounded">+0 st</span>
-                </div>
+              <div className="p-3 flex flex-col gap-2.5">
+                {[
+                  { label: 'Root Note', value: 'C3' },
+                  { label: 'Tune', value: '+0 st' },
+                  { label: 'Pitch', value: '0.00' },
+                  { label: 'Pan', value: 'C' },
+                ].map(({ label, value }) => (
+                  <div key={label} className="flex justify-between items-center">
+                    <span className="text-[10px] text-gray-600 uppercase tracking-wider">{label}</span>
+                    <span className="text-[11px] text-accent-cyan font-mono bg-black/40 px-1.5 py-0.5 rounded text-right min-w-[36px]">{value}</span>
+                  </div>
+                ))}
               </div>
             </div>
 
             {/* Master Volume Section */}
-            <div className="w-64 bg-panel-bg flex flex-col shrink-0">
-              <div className="bg-header-bg text-text-muted text-[10px] h-7 font-bold px-2 py-1 border-b border-border-dark uppercase tracking-wider">
+            <div className="w-52 bg-panel-bg flex flex-col shrink-0">
+              <div className="bg-[#161616] text-text-muted text-[10px] h-7 font-bold px-2.5 py-1 border-b border-[#1e1e1e] uppercase tracking-widest flex items-center">
                 Master
               </div>
-              <div className="flex items-center justify-around flex-1 px-2 pb-2">
+              <div className="flex items-center justify-around flex-1 px-3 pb-2">
                 <div className="flex flex-col items-center gap-1">
-                  <VUMeter level={vuLevel} width={54} height={54} />
-                  <span className="text-[11px] font-medium text-text-muted">VU</span>
+                  <VUMeter level={vuLevel} width={48} height={60} />
+                  <span className="text-[9px] font-bold text-gray-600 uppercase tracking-widest">VU</span>
                 </div>
                 <Knob
                   label="Master"
@@ -606,6 +700,10 @@ const App: React.FC = () => {
             onToggle={handlePadToggle}
             onPlay={playPad}
             onFileLoadToPad={handleFileLoadToPad as any}
+            onSwapPads={handleSwapPads}
+            onCopyPadTo={handleCopyPadTo}
+            onClearPad={handleClearPad}
+            onPathDrop={handlePathDrop}
           />
 
           {/* Bottom Effects Rack */}
@@ -687,6 +785,67 @@ const App: React.FC = () => {
             />
             <div className="mt-2 text-[11px] text-text-muted leading-relaxed">
               Set to 0 for auto (uses latency). Setting an explicit frame size overrides latency.
+            </div>
+          </div>
+
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">
+              Sample Rate
+            </div>
+            <MenuSelect
+              value={String(sampleRate)}
+              placeholder="Device default"
+              items={[
+                { label: 'Device default', value: '0' },
+                { label: '44100 Hz', value: '44100' },
+                { label: '48000 Hz', value: '48000' },
+                { label: '96000 Hz', value: '96000' },
+              ]}
+              onChange={(v) => applySampleRate(Number(v))}
+            />
+            <div className="mt-2 text-[11px] text-text-muted leading-relaxed">
+              Custom rates require WASAPI Exclusive mode.
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted">
+                WASAPI Exclusive Mode
+              </div>
+              <div className="mt-1 text-[11px] text-text-muted leading-relaxed">
+                Direct hardware access for minimum latency.
+              </div>
+            </div>
+            <button
+              onClick={() => applyWasapiExclusive(!wasapiExclusive)}
+              className={`w-10 h-5 rounded-full transition-colors shrink-0 ml-4 ${
+                wasapiExclusive ? 'bg-accent-cyan' : 'bg-[#2a2a2a]'
+              }`}
+            >
+              <span
+                className={`block w-4 h-4 rounded-full bg-white shadow mx-0.5 transition-transform ${
+                  wasapiExclusive ? 'translate-x-5' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </div>
+
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">
+              MIDI Input Device
+            </div>
+            <MenuSelect
+              value={selectedMidiInput}
+              placeholder="(No MIDI inputs detected)"
+              items={[
+                { label: '— None —', value: '' },
+                ...midiInputPorts.map(p => ({ label: p, value: p })),
+              ]}
+              onChange={(v) => applyMidiInput(v)}
+            />
+            <div className="mt-2 text-[11px] text-text-muted leading-relaxed">
+              MIDI notes 36–67 trigger pads 1–32 (GM drum map).
             </div>
           </div>
         </div>

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::sync::OnceLock;
@@ -19,6 +20,7 @@ use winit::{
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use wry::{WebView, http::Request};
+use midir::{MidiInput, MidiInputConnection};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -46,6 +48,13 @@ enum AudioCommand {
     SetBufferSizeFrames { frames: u32 },
     CheckUnsavedChanges,
     ConfirmExit,
+    ListDirectory { path: Option<String> },
+    GetPresets {},
+    GetLibrary {},
+    GetMidiInputs {},
+    SetMidiInput { port_name: Option<String> },
+    SetWasapiExclusive { exclusive: bool },
+    SetSampleRate { rate: u32 },
 }
 
 fn available_output_devices(backend: &str) -> Vec<String> {
@@ -71,6 +80,9 @@ struct AppSettings {
     playback_backend: Option<String>,
     playback_device_name: Option<String>,
     buffer_size_frames: Option<u32>,
+    midi_input_port: Option<String>,
+    wasapi_exclusive: bool,
+    sample_rate: Option<u32>,
 }
 
 impl Default for AppSettings {
@@ -81,6 +93,9 @@ impl Default for AppSettings {
             playback_backend: None,
             playback_device_name: None,
             buffer_size_frames: None,
+            midi_input_port: None,
+            wasapi_exclusive: false,
+            sample_rate: None,
         }
     }
 }
@@ -171,6 +186,28 @@ fn save_settings(settings: &AppSettings) {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct FsEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PresetInfo {
+    name: String,
+    path: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct LibraryEntry {
+    name: String,
+    path: String,
+    size: u64,
+    ext: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct WaveformData {
     pad_id: usize,
     peaks: Vec<f32>,
@@ -222,6 +259,7 @@ struct AudioEngine {
     config: StreamConfig,
     buffers: Arc<Mutex<Vec<AudioBuffer>>>,
     stream: Option<Stream>,
+    exclusive_stop_flag: Option<Arc<AtomicBool>>,
     master_volume: Arc<Mutex<f32>>,
     next_voice_id: Arc<Mutex<usize>>,
     sample_cache: Arc<Mutex<HashMap<String, Vec<f32>>>>,
@@ -253,6 +291,7 @@ impl AudioEngine {
             config,
             buffers,
             stream: None,
+            exclusive_stop_flag: None,
             master_volume,
             next_voice_id,
             sample_cache,
@@ -280,8 +319,25 @@ impl AudioEngine {
         let device = select_output_device(&host, settings.playback_device_name.as_deref())?
             .ok_or_else(|| anyhow::anyhow!("No output device available"))?;
 
-        let config = device.default_output_config()?;
-        let config: StreamConfig = config.into();
+        let config: StreamConfig = if let Some(sr) = settings.sample_rate {
+            device.supported_output_configs()
+                .ok()
+                .and_then(|configs| {
+                    configs
+                        .filter(|c| c.min_sample_rate() <= sr && c.max_sample_rate() >= sr)
+                        .find(|c| c.sample_format() == cpal::SampleFormat::F32)
+                })
+                .map(|c| c.with_sample_rate(sr).into())
+                .unwrap_or_else(|| device.default_output_config()
+                    .map(|c| c.into())
+                    .unwrap_or_else(|_| StreamConfig {
+                        channels: 2,
+                        sample_rate: 48000,
+                        buffer_size: BufferSize::Default,
+                    }))
+        } else {
+            device.default_output_config()?.into()
+        };
         let config = apply_stream_tuning_to_config(config, &settings);
 
         self.host_id = host_id;
@@ -292,6 +348,10 @@ impl AudioEngine {
     }
 
     fn restart_stream(&mut self) -> Result<()> {
+        if let Some(flag) = self.exclusive_stop_flag.take() {
+            flag.store(true, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
         if let Some(stream) = self.stream.take() {
             drop(stream);
         }
@@ -299,6 +359,23 @@ impl AudioEngine {
     }
 
     fn start_stream(&mut self) -> Result<()> {
+        let settings = self.get_settings_snapshot();
+
+        #[cfg(target_os = "windows")]
+        {
+            let is_wasapi = settings.playback_backend
+                .as_deref()
+                .map(|b| b.to_ascii_uppercase() == "WASAPI")
+                .unwrap_or(true);
+
+            if settings.wasapi_exclusive && is_wasapi {
+                if self.exclusive_stop_flag.is_none() {
+                    return self.start_exclusive_stream_wasapi();
+                }
+                return Ok(());
+            }
+        }
+
         if self.stream.is_some() {
             return Ok(());
         }
@@ -505,6 +582,149 @@ impl AudioEngine {
             println!("Playback device set to {}", device_name);
         }
     }
+
+    fn set_wasapi_exclusive(&mut self, exclusive: bool) {
+        if let Ok(mut s) = self.settings.lock() {
+            s.wasapi_exclusive = exclusive;
+            save_settings(&s);
+        }
+        if let Ok(mut cache) = self.sample_cache.lock() {
+            cache.clear();
+        }
+        if let Err(e) = self.restart_stream() {
+            eprintln!("Failed restarting stream after exclusive mode change: {}", e);
+        } else {
+            println!("WASAPI exclusive mode: {}", exclusive);
+        }
+    }
+
+    fn set_sample_rate(&mut self, rate: u32) {
+        if let Ok(mut s) = self.settings.lock() {
+            s.sample_rate = if rate == 0 { None } else { Some(rate) };
+            save_settings(&s);
+        }
+        if let Ok(mut cache) = self.sample_cache.lock() {
+            cache.clear();
+        }
+        if let Err(e) = self.rebuild_device_and_config() {
+            eprintln!("Failed rebuilding config after sample rate change: {}", e);
+        }
+        if let Err(e) = self.restart_stream() {
+            eprintln!("Failed restarting stream after sample rate change: {}", e);
+        } else {
+            println!("Sample rate set to {}Hz", rate);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn start_exclusive_stream_wasapi(&mut self) -> Result<()> {
+        let settings = self.get_settings_snapshot();
+        let sample_rate = settings.sample_rate.unwrap_or(48000) as usize;
+        self.config.sample_rate = sample_rate as u32;
+        if let Ok(mut cache) = self.sample_cache.lock() {
+            cache.clear();
+        }
+        let buffers = self.buffers.clone();
+        let master_volume = self.master_volume.clone();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag_clone = stop_flag.clone();
+        thread::spawn(move || {
+            if let Err(e) = run_exclusive_render_loop(sample_rate, buffers, master_volume, stop_flag_clone) {
+                eprintln!("WASAPI exclusive render error: {}", e);
+            }
+        });
+        self.exclusive_stop_flag = Some(stop_flag);
+        println!("WASAPI Exclusive stream started at {}Hz", sample_rate);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_exclusive_render_loop(
+    sample_rate: usize,
+    buffers: Arc<Mutex<Vec<AudioBuffer>>>,
+    master_volume: Arc<Mutex<f32>>,
+    stop_flag: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    use wasapi::{initialize_mta, get_default_device, Direction, ShareMode, SampleType, WaveFormat};
+
+    initialize_mta().map_err(|e| anyhow::anyhow!("COM init: {}", e))?;
+    let device = get_default_device(&Direction::Render)
+        .map_err(|e| anyhow::anyhow!("WASAPI device: {}", e))?;
+    let mut audio_client = device.get_iaudioclient()
+        .map_err(|e| anyhow::anyhow!("IAudioClient: {}", e))?;
+
+    let wave_fmt = WaveFormat::new(32, 32, &SampleType::Float, sample_rate, 2, None);
+    let (_, min_period) = audio_client.get_periods()
+        .map_err(|e| anyhow::anyhow!("get_periods: {}", e))?;
+
+    audio_client.initialize_client(
+        &wave_fmt,
+        min_period,
+        &Direction::Render,
+        &ShareMode::Exclusive,
+        true,
+    ).map_err(|e| anyhow::anyhow!("initialize_client: {}", e))?;
+
+    let h_event = audio_client.set_get_eventhandle()
+        .map_err(|e| anyhow::anyhow!("set_get_eventhandle: {}", e))?;
+    let mut render_client = audio_client.get_audiorenderclient()
+        .map_err(|e| anyhow::anyhow!("get_audiorenderclient: {}", e))?;
+    let buffer_frame_count = audio_client.get_bufferframecount()
+        .map_err(|e| anyhow::anyhow!("get_bufferframecount: {}", e))?;
+
+    audio_client.start_stream()
+        .map_err(|e| anyhow::anyhow!("start_stream: {}", e))?;
+
+    let blockalign = wave_fmt.get_blockalign() as usize;
+    let frames_available = buffer_frame_count as usize;
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        if h_event.wait_for_event(200).is_err() {
+            continue;
+        }
+
+        let mut audio_bytes: Vec<u8> = Vec::with_capacity(frames_available * blockalign);
+        {
+            let mut bufs = match buffers.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let master_vol = match master_volume.lock() {
+                Ok(g) => *g,
+                Err(p) => *p.into_inner(),
+            };
+            for _ in 0..frames_available {
+                let mut mixed = 0.0f32;
+                for buf in bufs.iter_mut() {
+                    mixed += buf.next_sample();
+                }
+                mixed *= master_vol;
+                mixed = if mixed > 1.0 {
+                    1.0 - (1.0 / (mixed + 1.0))
+                } else if mixed < -1.0 {
+                    -1.0 + (1.0 / (-mixed + 1.0))
+                } else {
+                    mixed
+                };
+                audio_bytes.extend_from_slice(&mixed.to_le_bytes()); // left
+                audio_bytes.extend_from_slice(&mixed.to_le_bytes()); // right
+            }
+            bufs.retain(|b| !b.is_finished());
+        }
+
+        if let Err(e) = render_client.write_to_device(
+            frames_available,
+            blockalign,
+            &audio_bytes,
+            None,
+        ) {
+            eprintln!("write_to_device: {}", e);
+        }
+    }
+
+    let _ = audio_client.stop_stream();
+    Ok(())
 }
 
 fn select_output_device(host: &cpal::Host, preferred_name: Option<&str>) -> Result<Option<Device>> {
@@ -687,6 +907,12 @@ enum AppEvent {
     AudioSettings { settings: AppSettings },
     AudioBackends { backends: Vec<String> },
     AudioDevices { devices: Vec<String> },
+    DirectoryListing { path: String, entries: Vec<FsEntry> },
+    PresetList { presets: Vec<PresetInfo> },
+    LibraryFiles { entries: Vec<LibraryEntry> },
+    MidiInputs { ports: Vec<String> },
+    ConnectMidi { port_name: Option<String> },
+    MidiNote { note: u8, velocity: u8, channel: u8 },
 }
 
 struct App {
@@ -698,6 +924,7 @@ struct App {
     html_content: String,
     is_ready: bool,
     pending_close: bool,
+    midi_connection: Option<MidiInputConnection<()>>,
 }
 
 impl App {
@@ -717,6 +944,7 @@ impl App {
             html_content,
             is_ready: false,
             pending_close: false,
+            midi_connection: None,
         })
     }
     
@@ -906,6 +1134,93 @@ impl ApplicationHandler for App {
                 AudioCommand::ConfirmExit => {
                     std::process::exit(0);
                 }
+                AudioCommand::ListDirectory { path } => {
+                    let tx_clone = ipc_tx.clone();
+                    thread::spawn(move || {
+                        let dir_path = path.unwrap_or_else(|| {
+                            std::env::var("USERPROFILE")
+                                .or_else(|_| std::env::var("HOME"))
+                                .unwrap_or_else(|_| ".".to_string())
+                        });
+                        let mut entries: Vec<FsEntry> = Vec::new();
+                        if let Ok(read_dir) = std::fs::read_dir(&dir_path) {
+                            for entry in read_dir.filter_map(|e| e.ok()) {
+                                let meta = entry.metadata().ok();
+                                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                                let size = if !is_dir { meta.map(|m| m.len()) } else { None };
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                let path_str = entry.path().to_string_lossy().to_string();
+                                let ext = entry.path()
+                                    .extension()
+                                    .map(|e| e.to_string_lossy().to_lowercase().to_string())
+                                    .unwrap_or_default();
+                                if is_dir || matches!(ext.as_str(), "wav" | "mp3" | "flac" | "ogg" | "aiff") {
+                                    entries.push(FsEntry { name, path: path_str, is_dir, size });
+                                }
+                            }
+                        }
+                        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+                            (true, false) => std::cmp::Ordering::Less,
+                            (false, true) => std::cmp::Ordering::Greater,
+                            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                        });
+                        let _ = tx_clone.send(AppEvent::DirectoryListing { path: dir_path, entries });
+                    });
+                }
+                AudioCommand::GetPresets {} => {
+                    let base = settings_path().join("presets");
+                    let tx_clone = ipc_tx.clone();
+                    thread::spawn(move || {
+                        let _ = std::fs::create_dir_all(&base);
+                        let mut presets: Vec<PresetInfo> = Vec::new();
+                        if let Ok(read_dir) = std::fs::read_dir(&base) {
+                            for entry in read_dir.filter_map(|e| e.ok()) {
+                                let ext = entry.path()
+                                    .extension()
+                                    .map(|e| e.to_string_lossy().to_lowercase().to_string())
+                                    .unwrap_or_default();
+                                if ext == "json" || ext == "toml" {
+                                    let name = entry.path()
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let path = entry.path().to_string_lossy().to_string();
+                                    presets.push(PresetInfo { name, path });
+                                }
+                            }
+                        }
+                        presets.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                        let _ = tx_clone.send(AppEvent::PresetList { presets });
+                    });
+                }
+                AudioCommand::GetLibrary {} => {
+                    let base = settings_path().join("library");
+                    let tx_clone = ipc_tx.clone();
+                    thread::spawn(move || {
+                        let _ = std::fs::create_dir_all(&base);
+                        let mut entries: Vec<LibraryEntry> = Vec::new();
+                        scan_audio_dir(&base, &mut entries);
+                        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                        let _ = tx_clone.send(AppEvent::LibraryFiles { entries });
+                    });
+                }
+                AudioCommand::GetMidiInputs {} => {
+                    let ports = list_midi_inputs();
+                    let _ = ipc_tx.send(AppEvent::MidiInputs { ports });
+                }
+                AudioCommand::SetMidiInput { port_name } => {
+                    let _ = ipc_tx.send(AppEvent::ConnectMidi { port_name });
+                }
+                AudioCommand::SetWasapiExclusive { exclusive } => {
+                    if let Ok(mut eng) = ipc_engine.lock() {
+                        eng.set_wasapi_exclusive(exclusive);
+                    }
+                }
+                AudioCommand::SetSampleRate { rate } => {
+                    if let Ok(mut eng) = ipc_engine.lock() {
+                        eng.set_sample_rate(rate);
+                    }
+                }
             }
         };
 
@@ -977,7 +1292,8 @@ impl ApplicationHandler for App {
     }
     
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(rx) = &self.event_rx {
+        let rx_opt = self.event_rx.take();
+        if let Some(ref rx) = rx_opt {
             while let Ok(event) = rx.try_recv() {
                 match event {
                     AppEvent::FileDropped { path, x, y } => {
@@ -1056,6 +1372,158 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                    AppEvent::DirectoryListing { path, entries } => {
+                        #[derive(Serialize)]
+                        struct DirPayload { path: String, entries: Vec<FsEntry> }
+                        let payload = DirPayload { path, entries };
+                        if let Ok(json) = serde_json::to_string(&payload) {
+                            let js = format!(
+                                "window.dispatchEvent(new CustomEvent('rust-dir-listing', {{ detail: {} }}));",
+                                json
+                            );
+                            if let Some(webview) = &self.webview {
+                                let _ = webview.evaluate_script(&js);
+                            }
+                        }
+                    }
+                    AppEvent::PresetList { presets } => {
+                        if let Ok(json) = serde_json::to_string(&presets) {
+                            let js = format!(
+                                "window.dispatchEvent(new CustomEvent('rust-presets', {{ detail: {} }}));",
+                                json
+                            );
+                            if let Some(webview) = &self.webview {
+                                let _ = webview.evaluate_script(&js);
+                            }
+                        }
+                    }
+                    AppEvent::LibraryFiles { entries } => {
+                        if let Ok(json) = serde_json::to_string(&entries) {
+                            let js = format!(
+                                "window.dispatchEvent(new CustomEvent('rust-library', {{ detail: {} }}));",
+                                json
+                            );
+                            if let Some(webview) = &self.webview {
+                                let _ = webview.evaluate_script(&js);
+                            }
+                        }
+                    }
+                    AppEvent::MidiInputs { ports } => {
+                        if let Ok(json) = serde_json::to_string(&ports) {
+                            let js = format!(
+                                "window.dispatchEvent(new CustomEvent('rust-midi-inputs', {{ detail: {} }}));",
+                                json
+                            );
+                            if let Some(webview) = &self.webview {
+                                let _ = webview.evaluate_script(&js);
+                            }
+                        }
+                    }
+                    AppEvent::ConnectMidi { port_name } => {
+                        self.midi_connection = None;
+                        if let Some(name) = port_name {
+                            let tx_clone = self.event_tx.as_ref().map(|t| t.clone());
+                            if let Some(tx) = tx_clone {
+                                self.midi_connection = connect_midi_input(&name, tx);
+                                if self.midi_connection.is_some() {
+                                    println!("MIDI connected: {}", name);
+                                    if let Some(engine) = &self.audio_engine {
+                                        if let Ok(eng) = engine.lock() {
+                                            if let Ok(mut s) = eng.settings.lock() {
+                                                s.midi_input_port = Some(name);
+                                                save_settings(&s);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    eprintln!("MIDI port not found or connect failed");
+                                }
+                            }
+                        } else {
+                            if let Some(engine) = &self.audio_engine {
+                                if let Ok(eng) = engine.lock() {
+                                    if let Ok(mut s) = eng.settings.lock() {
+                                        s.midi_input_port = None;
+                                        save_settings(&s);
+                                    }
+                                }
+                            }
+                            println!("MIDI input disconnected");
+                        }
+                    }
+                    AppEvent::MidiNote { note, velocity, channel } => {
+                        let js = format!(
+                            "window.dispatchEvent(new CustomEvent('rust-midi-note', {{ detail: {{ note: {}, velocity: {}, channel: {} }} }}));",
+                            note, velocity, channel
+                        );
+                        if let Some(webview) = &self.webview {
+                            let _ = webview.evaluate_script(&js);
+                        }
+                    }
+                }
+            }
+        }
+        self.event_rx = rx_opt;
+    }
+}
+
+fn list_midi_inputs() -> Vec<String> {
+    match MidiInput::new("osmpdrum-list") {
+        Ok(midi_in) => midi_in
+            .ports()
+            .iter()
+            .filter_map(|p| midi_in.port_name(p).ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn connect_midi_input(
+    port_name: &str,
+    tx: Sender<AppEvent>,
+) -> Option<MidiInputConnection<()>> {
+    let midi_in = MidiInput::new("osmpdrum").ok()?;
+    let ports = midi_in.ports();
+    let port = ports
+        .iter()
+        .find(|p| midi_in.port_name(p).ok().as_deref() == Some(port_name))?;
+    midi_in
+        .connect(
+            port,
+            "osmpdrum-in",
+            move |_ts, data, _| {
+                if data.len() >= 3 {
+                    let kind = data[0] & 0xF0;
+                    let channel = data[0] & 0x0F;
+                    if kind == 0x90 && data[2] > 0 {
+                        let _ = tx.send(AppEvent::MidiNote {
+                            note: data[1],
+                            velocity: data[2],
+                            channel,
+                        });
+                    }
+                }
+            },
+            (),
+        )
+        .ok()
+}
+
+fn scan_audio_dir(dir: &std::path::Path, entries: &mut Vec<LibraryEntry>) {
+    if let Ok(read_dir) = std::fs::read_dir(dir) {
+        for entry in read_dir.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                scan_audio_dir(&path, entries);
+            } else if let Some(ext_os) = path.extension() {
+                let ext = ext_os.to_string_lossy().to_lowercase();
+                if matches!(ext.as_str(), "wav" | "mp3" | "flac" | "ogg" | "aiff") {
+                    let name = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    let path_str = path.to_string_lossy().to_string();
+                    entries.push(LibraryEntry { name, path: path_str, size, ext: ext.to_string() });
                 }
             }
         }
