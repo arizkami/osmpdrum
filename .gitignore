@@ -24,3 +24,12 @@ dist-ssr
 *.sw?
 
 target
+*.wav
+*.png
+*.xml
+
+test/**
+packtest
+# !test/
+# !test/**/
+# !test/**/*.json

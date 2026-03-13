@@ -34,10 +34,12 @@ use thiserror::Error;
 
 pub const MAGIC: [u8; 4]          = *b"OSMP";
 pub const VERSION: u32             = 1;
+/// Version with embedded JSON zone map.
+pub const VERSION_2: u32           = 2;
 pub const HEADER_SIZE: usize       = 64;
 pub const SAMPLE_ENTRY_SIZE: usize = 64;
 /// Practical upper bound: 3200 × 64 B = 200 KB table.
-pub const MAX_SAMPLES: usize       = 3200;
+pub const MAX_SAMPLES: usize       = 6400;
 
 /// Raw PCM sample format stored in the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +86,13 @@ pub enum OsmpError {
     CapacityExceeded(usize, usize),
     #[error("file is truncated or corrupted")]
     Truncated,
+    #[error("JSON parse error: {0}")]
+    InvalidJson(String),
 }
 
 pub type Result<T> = std::result::Result<T, OsmpError>;
+
+pub mod sfzjson;
 
 // ── Container header (64 bytes) ────────────────────────────────────────────────
 
@@ -107,11 +113,15 @@ pub struct ContainerHeader {
     pub flags:       u32,
     /// Container / kit name (≤ 31 UTF-8 bytes).
     pub name:        String,
+    /// Byte length of the embedded JSON zone-map blob (0 = none, v1 compat).
+    /// The blob is stored immediately after the 64-byte header, zero-padded
+    /// to the next 64-byte boundary before the sample table begins.
+    pub json_len:    u32,
 }
 
 impl ContainerHeader {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { version: VERSION, num_samples: 0, flags: 0, name: name.into() }
+        Self { version: VERSION, num_samples: 0, flags: 0, name: name.into(), json_len: 0 }
     }
 
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self> {
@@ -120,7 +130,9 @@ impl ContainerHeader {
         if magic != MAGIC { return Err(OsmpError::BadMagic); }
 
         let version     = r.read_u32::<LittleEndian>()?;
-        if version != VERSION { return Err(OsmpError::BadVersion(version)); }
+        if version != VERSION && version != VERSION_2 {
+            return Err(OsmpError::BadVersion(version));
+        }
 
         let num_samples = r.read_u32::<LittleEndian>()?;
         let flags       = r.read_u32::<LittleEndian>()?;
@@ -130,10 +142,12 @@ impl ContainerHeader {
         let name = std::str::from_utf8(&name_buf)
             .unwrap_or("").trim_end_matches('\0').to_owned();
 
-        let mut _reserved = [0u8; 16];
+        // bytes [48..52] = json_len (was "reserved" in v1, safely zero)
+        let json_len = r.read_u32::<LittleEndian>()?;
+        let mut _reserved = [0u8; 12];
         r.read_exact(&mut _reserved)?;
 
-        Ok(Self { version, num_samples, flags, name })
+        Ok(Self { version, num_samples, flags, name, json_len })
     }
 
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
@@ -146,16 +160,26 @@ impl ContainerHeader {
         let b = self.name.as_bytes();
         nb[..b.len().min(31)].copy_from_slice(&b[..b.len().min(31)]);
         w.write_all(&nb)?;
-        w.write_all(&[0u8; 16])?;
+        // [48..52] json_len, [52..64] reserved
+        w.write_u32::<LittleEndian>(self.json_len)?;
+        w.write_all(&[0u8; 12])?;
         Ok(())
     }
 
-    /// Byte offset of the sample table (always immediately after the header).
-    #[inline] pub fn table_offset() -> u64 { HEADER_SIZE as u64 }
+    /// Bytes the JSON blob occupies on disk (padded to 64-byte boundary).
+    #[inline] pub fn json_blob_padded(json_len: u32) -> u64 {
+        let n = json_len as u64;
+        if n == 0 { 0 } else { (n + 63) & !63 }
+    }
+
+    /// Byte offset of the sample table.
+    #[inline] pub fn table_offset(json_len: u32) -> u64 {
+        HEADER_SIZE as u64 + Self::json_blob_padded(json_len)
+    }
 
     /// Byte offset where audio data begins given `capacity` reserved entries.
-    #[inline] pub fn audio_offset(capacity: u32) -> u64 {
-        HEADER_SIZE as u64 + capacity as u64 * SAMPLE_ENTRY_SIZE as u64
+    #[inline] pub fn audio_offset(capacity: u32, json_len: u32) -> u64 {
+        Self::table_offset(json_len) + capacity as u64 * SAMPLE_ENTRY_SIZE as u64
     }
 }
 
@@ -279,11 +303,25 @@ impl OsmpFile {
         let mut file = File::open(path)?;
         let mut br   = BufReader::new(&mut file);
         let header   = ContainerHeader::read_from(&mut br)?;
+        // Skip over JSON blob (if any) to reach the sample table
+        let table_off = ContainerHeader::table_offset(header.json_len);
+        if header.json_len > 0 {
+            br.seek(SeekFrom::Start(table_off))?;
+        }
         let mut samples = Vec::with_capacity(header.num_samples as usize);
         for _ in 0..header.num_samples {
             samples.push(SampleEntry::read_from(&mut br)?);
         }
         Ok(Self { header, samples, file })
+    }
+
+    /// Read the embedded JSON zone-map string, or `None` if not present.
+    pub fn read_json(&mut self) -> Result<Option<String>> {
+        if self.header.json_len == 0 { return Ok(None); }
+        self.file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+        let mut buf = vec![0u8; self.header.json_len as usize];
+        self.file.read_exact(&mut buf)?;
+        Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
     }
 
     /// Decode sample `index` fully into `Vec<f32>` (normalised −1.0 … +1.0).
@@ -385,11 +423,30 @@ impl OsmpMmapReader {
 
         let mut cur = std::io::Cursor::new(&mmap[..]);
         let header  = ContainerHeader::read_from(&mut cur)?;
+        // Skip over JSON blob to reach sample table
+        let table_off = ContainerHeader::table_offset(header.json_len);
+        if header.json_len > 0 {
+            cur.set_position(table_off);
+        }
         let mut samples = Vec::with_capacity(header.num_samples as usize);
         for _ in 0..header.num_samples {
             samples.push(SampleEntry::read_from(&mut cur)?);
         }
         Ok(Self { header, samples, mmap })
+    }
+
+    /// Raw bytes of the embedded JSON blob, or `None` if not present.
+    pub fn json_bytes(&self) -> Option<&[u8]> {
+        if self.header.json_len == 0 { return None; }
+        let start = HEADER_SIZE;
+        let end   = start + self.header.json_len as usize;
+        if end > self.mmap.len() { return None; }
+        Some(&self.mmap[start..end])
+    }
+
+    /// Decode the embedded JSON blob as a UTF-8 string.
+    pub fn read_json(&self) -> Option<String> {
+        self.json_bytes().map(|b| String::from_utf8_lossy(b).into_owned())
     }
 
     /// Raw bytes of sample `index` — zero allocation, zero copy.
@@ -436,26 +493,53 @@ pub struct OsmpWriter {
     samples:     Vec<SampleEntry>,
     pub capacity:    u32,
     pub audio_start: u64,
+    pub table_start: u64,
     pos:         u64,
 }
 
 impl OsmpWriter {
     pub fn new<P: AsRef<Path>>(path: P, header: ContainerHeader, capacity: u32) -> Result<Self> {
+        Self::new_with_json(path, header, capacity, &[])
+    }
+
+    /// Create a new container with an embedded JSON zone-map blob.
+    /// Bumps the container version to `VERSION_2`.
+    pub fn new_with_json<P: AsRef<Path>>(
+        path:     P,
+        header:   ContainerHeader,
+        capacity: u32,
+        json:     &[u8],
+    ) -> Result<Self> {
         if capacity as usize > MAX_SAMPLES {
             return Err(OsmpError::CapacityExceeded(capacity as usize, MAX_SAMPLES));
         }
         let file = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
         let mut bw = BufWriter::new(file);
 
-        let mut hdr = header.clone();
+        let json_len   = json.len() as u32;
+        let padded_len = ContainerHeader::json_blob_padded(json_len) as usize;
+
+        let mut hdr    = header.clone();
         hdr.num_samples = 0;
+        hdr.json_len    = json_len;
+        hdr.version     = if json_len > 0 { VERSION_2 } else { VERSION };
         hdr.write_to(&mut bw)?;
+
+        // Write JSON blob + zero-pad to 64-byte boundary
+        if json_len > 0 {
+            bw.write_all(json)?;
+            let padding = padded_len - json_len as usize;
+            if padding > 0 {
+                bw.write_all(&vec![0u8; padding])?;
+            }
+        }
 
         // Reserve sample table space (filled with zeros, patched in finish())
         bw.write_all(&vec![0u8; capacity as usize * SAMPLE_ENTRY_SIZE])?;
 
-        let audio_start = ContainerHeader::audio_offset(capacity);
-        Ok(Self { writer: bw, header, samples: Vec::new(), capacity, audio_start, pos: audio_start })
+        let table_start = ContainerHeader::table_offset(json_len);
+        let audio_start = ContainerHeader::audio_offset(capacity, json_len);
+        Ok(Self { writer: bw, header: hdr, samples: Vec::new(), capacity, audio_start, table_start, pos: audio_start })
     }
 
     /// Write raw PCM data for one sample and register its metadata.
@@ -501,6 +585,11 @@ impl OsmpWriter {
         // Patch container header at byte 0
         file.seek(SeekFrom::Start(0))?;
         self.header.write_to(&mut file)?;
+
+        // Seek to sample table (after header + optional JSON blob)
+        if self.table_start > HEADER_SIZE as u64 {
+            file.seek(SeekFrom::Start(self.table_start))?;
+        }
 
         // Patch sample entries into the reserved table area
         for se in &self.samples {
@@ -585,9 +674,9 @@ fn encode_f32(samples: &[f32], fmt: SampleFormat) -> Vec<u8> {
 
 // ── Convenience ───────────────────────────────────────────────────────────────
 
-/// Byte offset of the first audio byte given `capacity` reserved entries.
+/// Byte offset of the first audio byte given `capacity` reserved entries (no JSON blob).
 pub fn audio_data_offset(capacity: u32) -> u64 {
-    ContainerHeader::audio_offset(capacity)
+    ContainerHeader::audio_offset(capacity, 0)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -749,6 +838,66 @@ mod tests {
         }
 
         std::fs::remove_file(&tmp).ok();
+    }
+
+    // ── v2 JSON blob round-trip ───────────────────────────────────────────────
+
+    #[test]
+    fn v2_json_blob_round_trip() {
+        let tmp  = std::env::temp_dir().join("test_v2_json.osmp");
+        let json = r#"{"name":"TestKit","zones":[]}"#;
+        let data: Vec<f32> = (0..480).map(|i| i as f32 / 480.0 - 0.5).collect();
+
+        let hdr = ContainerHeader::new("V2Kit");
+        let mut w = OsmpWriter::new_with_json(&tmp, hdr, 1, json.as_bytes()).unwrap();
+        w.add_sample_f32(make_entry("kick", 48000, 1, SampleFormat::S24LE), &data).unwrap();
+        let fhdr = w.finish().unwrap();
+
+        // Header should reflect v2
+        assert_eq!(fhdr.version,  VERSION_2);
+        assert_eq!(fhdr.json_len, json.len() as u32);
+
+        // OsmpFile: read JSON and audio
+        let mut f = OsmpFile::open(&tmp).unwrap();
+        assert_eq!(f.header.version,      VERSION_2);
+        assert_eq!(f.header.json_len,     json.len() as u32);
+        assert_eq!(f.header.num_samples,  1);
+        assert_eq!(f.samples[0].name,     "kick");
+
+        let got_json = f.read_json().unwrap().unwrap();
+        assert_eq!(got_json, json);
+
+        let got_audio = f.read_sample(0).unwrap();
+        assert_eq!(got_audio.len(), data.len());
+        for (a, b) in data.iter().zip(got_audio.iter()) {
+            assert!((a - b).abs() < 2.0 / 8_388_608.0);
+        }
+
+        // OsmpMmapReader: read JSON and audio
+        let mm = OsmpMmapReader::open(&tmp).unwrap();
+        assert_eq!(mm.header.json_len, json.len() as u32);
+        assert_eq!(mm.read_json().unwrap(), json);
+        assert_eq!(mm.samples[0].name, "kick");
+
+        let got_mm = mm.sample_f32(0).unwrap();
+        assert_eq!(got_mm.len(), data.len());
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn v2_table_and_audio_offsets() {
+        // json_len=0  → same as v1
+        assert_eq!(ContainerHeader::table_offset(0),  HEADER_SIZE as u64);
+        assert_eq!(ContainerHeader::audio_offset(4, 0),
+            HEADER_SIZE as u64 + 4 * SAMPLE_ENTRY_SIZE as u64);
+
+        // json_len=100 → padded to 128
+        assert_eq!(ContainerHeader::json_blob_padded(100), 128);
+        assert_eq!(ContainerHeader::table_offset(100),  HEADER_SIZE as u64 + 128);
+
+        // json_len=64 → exactly 64
+        assert_eq!(ContainerHeader::json_blob_padded(64), 64);
     }
 
     // ── Capacity guard ────────────────────────────────────────────────────────

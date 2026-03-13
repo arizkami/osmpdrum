@@ -3,7 +3,20 @@ name = "osmpcore"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "osmpcore"
+path = "src/lib.rs"
+
+[[bin]]
+name = "osmp"
+path = "sdk/main.rs"
+
 [dependencies]
-memmap2   = "0.9"
-thiserror = "1"
-byteorder = "1"
+memmap2    = "0.9"
+thiserror  = "1"
+byteorder  = "1"
+clap       = { version = "4", features = ["derive"] }
+hound      = "3"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+claxon     = "0.4"
