@@ -1,39 +1,49 @@
 
-// Interface for the IPC messages
-interface AudioCommand {
-    command:
-        | 'Play'
-        | 'Stop'
-        | 'Load'
-        | 'SetMasterVolume'
-        | 'SetPlaybackLatency'
-        | 'GetAudioSettings'
-        | 'GetAudioBackends'
-        | 'GetAudioDevices'
-        | 'SetPlaybackBackend'
-        | 'SetPlaybackDevice'
-        | 'SetBufferSizeFrames'
-        | 'ConfirmExit'
-        | 'ListDirectory'
-        | 'GetPresets'
-        | 'GetLibrary'
-        | 'GetMidiInputs'
-        | 'SetMidiInput'
-        | 'SetWasapiExclusive'
-        | 'SetSampleRate';
-    payload: any;
-}
+const WS_URL = `ws://${window.location.host}/ws`;
 
 export class AudioEngine {
+    private ws: WebSocket | null = null;
+    private queue: string[] = [];
+    private ready = false;
+
     constructor() {
-        // No initialization needed for Wry IPC
+        this.connect();
+    }
+
+    private connect() {
+        const ws = new WebSocket(WS_URL);
+        this.ws = ws;
+
+        ws.onopen = () => {
+            this.ready = true;
+            this.queue.forEach(msg => ws.send(msg));
+            this.queue = [];
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data as string) as { type: string; detail: unknown };
+                window.dispatchEvent(new CustomEvent(msg.type, { detail: msg.detail }));
+            } catch (e) {
+                console.error('WS message parse error', e);
+            }
+        };
+
+        ws.onclose = () => {
+            this.ready = false;
+            // Reconnect after 1 s
+            setTimeout(() => this.connect(), 1000);
+        };
+
+        ws.onerror = (e) => console.error('WS error', e);
     }
 
     private send(command: string, payload: any) {
-        if ((window as any).ipc) {
-            (window as any).ipc.postMessage(JSON.stringify({ command, payload }));
+        const msg = JSON.stringify({ command, payload });
+        if (this.ready && this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(msg);
         } else {
-            console.warn('Wry IPC not available');
+            this.queue.push(msg);
         }
     }
 

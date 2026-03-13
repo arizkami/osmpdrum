@@ -1,36 +1,26 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use anyhow::Result;
+use axum::{
+    extract::{State, WebSocketUpgrade},
+    extract::ws::{Message, WebSocket},
+    response::{Html, IntoResponse},
+    routing::get,
+    Router,
+};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::BufferSize;
-use cpal::{Device, Stream, StreamConfig};
+use cpal::{BufferSize, Device, Stream, StreamConfig};
+use futures_util::{SinkExt, StreamExt};
+use midir::{MidiInput, MidiInputConnection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
-use std::sync::OnceLock;
-use winit::{
-    application::ApplicationHandler,
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowId},
-};
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use wry::{WebView, http::Request};
-use midir::{MidiInput, MidiInputConnection};
+use tokio::sync::broadcast;
+use tower_http::cors::CorsLayer;
 
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CallWindowProcW, CreateMenu, CreatePopupMenu, DefWindowProcW, DrawMenuBar,
-    GetWindowLongPtrW, SetMenu, SetWindowLongPtrW, GWLP_WNDPROC, MF_POPUP, MF_STRING, WM_COMMAND,
-    WNDPROC,
-};
+const FRONTEND_HTML: &str = include_str!("../../dist/index.html");
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "command", content = "payload")]
@@ -101,9 +91,20 @@ impl Default for AppSettings {
 }
 
 fn settings_path() -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
     let base = std::env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    #[cfg(not(target_os = "windows"))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        });
+
     base.join("osmpdrum")
 }
 
@@ -761,8 +762,14 @@ fn parse_backend_host_id(backend: Option<&str>) -> cpal::HostId {
     match backend.map(|s| s.to_ascii_lowercase()) {
         #[cfg(feature = "asio")]
         Some(s) if s == "asio" => cpal::HostId::Asio,
+        #[cfg(target_os = "windows")]
         Some(s) if s == "ks" => cpal::HostId::Wasapi,
+        #[cfg(target_os = "windows")]
         Some(s) if s == "wasapi" => cpal::HostId::Wasapi,
+        #[cfg(target_os = "linux")]
+        Some(s) if s == "alsa" => cpal::HostId::Alsa,
+        #[cfg(all(target_os = "linux", feature = "jack"))]
+        Some(s) if s == "jack" => cpal::HostId::Jack,
         _ => cpal::default_host().id(),
     }
 }
@@ -771,81 +778,30 @@ fn available_backends() -> Vec<String> {
     let mut out = Vec::new();
     let mut has_wasapi = false;
     for host_id in cpal::available_hosts() {
-        // These are the only ones you asked to expose in UI.
         match host_id {
+            #[cfg(target_os = "windows")]
             cpal::HostId::Wasapi => {
                 has_wasapi = true;
                 out.push("WASAPI".to_string());
             }
+            #[cfg(target_os = "linux")]
+            cpal::HostId::Alsa => {
+                out.push("ALSA".to_string());
+            }
+            #[cfg(all(target_os = "linux", feature = "jack"))]
+            cpal::HostId::Jack => {
+                out.push("JACK".to_string());
+            }
+            #[cfg(not(target_os = "windows"))]
             _ => {}
         }
     }
-
     if has_wasapi {
         out.push("KS".to_string());
     }
     out
 }
 
-#[cfg(target_os = "windows")]
-const MENU_ID_AUDIO_SETTINGS: usize = 1001;
-
-#[cfg(target_os = "windows")]
-static MENU_TX: OnceLock<Sender<AppEvent>> = OnceLock::new();
-
-#[cfg(target_os = "windows")]
-static ORIGINAL_WNDPROC: OnceLock<isize> = OnceLock::new();
-
-#[cfg(target_os = "windows")]
-unsafe extern "system" fn menu_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if msg == WM_COMMAND {
-        let id = (wparam & 0xffff) as usize;
-        if id == MENU_ID_AUDIO_SETTINGS {
-            if let Some(tx) = MENU_TX.get() {
-                let _ = tx.send(AppEvent::OpenAudioSettings);
-            }
-            return 0;
-        }
-    }
-
-    if let Some(prev) = ORIGINAL_WNDPROC.get() {
-        let prev: WNDPROC = std::mem::transmute(*prev);
-        return CallWindowProcW(prev, hwnd, msg, wparam, lparam);
-    }
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-#[cfg(target_os = "windows")]
-fn to_wide(s: &str) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
-}
-
-#[cfg(target_os = "windows")]
-unsafe fn install_native_menu(window: &Window, tx: Sender<AppEvent>) {
-    let hwnd = match window.window_handle().ok().map(|h| h.as_raw()) {
-        Some(RawWindowHandle::Win32(h)) => h.hwnd.get() as HWND,
-        _ => return,
-    };
-    let _ = MENU_TX.set(tx);
-
-    // Subclass window proc to receive WM_COMMAND.
-    let prev = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
-    let _ = ORIGINAL_WNDPROC.set(prev);
-    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, menu_wndproc as isize);
-
-    let menu = CreateMenu();
-    let file_menu = CreatePopupMenu();
-
-    let audio_settings = to_wide("Audio Settings...");
-    AppendMenuW(file_menu, MF_STRING, MENU_ID_AUDIO_SETTINGS, audio_settings.as_ptr());
-
-    let file_label = to_wide("File");
-    AppendMenuW(menu, MF_POPUP, file_menu as usize, file_label.as_ptr());
-
-    SetMenu(hwnd, menu);
-    DrawMenuBar(hwnd);
-}
 
 fn load_wav_file(file_path: &str, target_sample_rate: u32) -> Result<Vec<f32>> {
     let mut reader = hound::WavReader::open(file_path)?;
@@ -899,579 +855,259 @@ fn load_wav_file(file_path: &str, target_sample_rate: u32) -> Result<Vec<f32>> {
     }
 }
 
-enum AppEvent {
-    FileDropped { path: String, x: f64, y: f64 },
-    WaveformReady(WaveformData),
-    CloseRequested,
-    OpenAudioSettings,
-    AudioSettings { settings: AppSettings },
-    AudioBackends { backends: Vec<String> },
-    AudioDevices { devices: Vec<String> },
-    DirectoryListing { path: String, entries: Vec<FsEntry> },
-    PresetList { presets: Vec<PresetInfo> },
-    LibraryFiles { entries: Vec<LibraryEntry> },
-    MidiInputs { ports: Vec<String> },
-    ConnectMidi { port_name: Option<String> },
-    MidiNote { note: u8, velocity: u8, channel: u8 },
+async fn serve_frontend() -> Html<&'static str> {
+    Html(FRONTEND_HTML)
 }
 
-struct App {
-    window: Option<Window>,
-    webview: Option<WebView>,
-    audio_engine: Option<Arc<Mutex<AudioEngine>>>,
-    event_rx: Option<Receiver<AppEvent>>,
-    event_tx: Option<Sender<AppEvent>>,
-    html_content: String,
-    is_ready: bool,
-    pending_close: bool,
-    midi_connection: Option<MidiInputConnection<()>>,
+// ── Server state ─────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct AppState {
+    engine:   Arc<Mutex<AudioEngine>>,
+    event_tx: broadcast::Sender<String>,
+    midi_conn: Arc<Mutex<Option<MidiInputConnection<()>>>>,
 }
 
-impl App {
-    fn new() -> Result<Self> {
-        let (tx, rx) = channel();
-        
-        // Pre-load HTML content at startup
-        let html_content = include_str!("../../dist/index.html").to_string();
-        println!("[Init] HTML content pre-loaded ({} bytes)", html_content.len());
-        
-        Ok(Self {
-            window: None,
-            webview: None,
-            audio_engine: None,
-            event_rx: Some(rx),
-            event_tx: Some(tx),
-            html_content,
-            is_ready: false,
-            pending_close: false,
-            midi_connection: None,
-        })
-    }
-    
-    fn initialize_audio_engine(&mut self) -> Result<Arc<Mutex<AudioEngine>>> {
-        let start = std::time::Instant::now();
-        
-        let engine = AudioEngine::new()?;
-        let engine = Arc::new(Mutex::new(engine));
-        
-        println!("[Init] Audio engine ready ({:?})", start.elapsed());
-        Ok(engine)
-    }
+// ── WebSocket handler ─────────────────────────────────────────────────────────
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut event_rx = state.event_tx.subscribe();
+
+    let send_task = tokio::spawn(async move {
+        while let Ok(msg) = event_rx.recv().await {
+            if sender.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
         }
+    });
 
-        let total_start = std::time::Instant::now();
-
-        // Pre-initialize audio engine before creating window
-        println!("[Init] Initializing audio engine...");
-        let engine = match self.initialize_audio_engine() {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("Failed to initialize audio engine: {}", e);
-                return;
-            }
-        };
-        
-        self.audio_engine = Some(engine.clone());
-
-        // Create window (hidden)
-        println!("[Init] Creating window...");
-        let window_attributes = Window::default_attributes()
-            .with_title("Opensampler Drummer")
-            .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0))
-            .with_visible(false); // Keep hidden until fully loaded
-        
-        let window = match event_loop.create_window(window_attributes) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("Failed to create window: {}", e);
-                return;
-            }
-        };
-
-        #[cfg(target_os = "windows")]
-        {
-            // Native Win32 menu is intentionally disabled.
-            // Menus are implemented in the React headerbar.
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Text(text) => handle_command(text.as_str(), &state).await,
+            Message::Close(_)   => break,
+            _                   => {}
         }
+    }
+    send_task.abort();
+}
 
-        let ipc_engine = engine.clone();
-        let ipc_tx = self.event_tx.as_ref().unwrap().clone();
+// ── IPC command router ────────────────────────────────────────────────────────
 
-        let handler = move |req: Request<String>| {
-            let command = match serde_json::from_str::<AudioCommand>(&req.body()) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to parse IPC command: {}. Body: {}", e, req.body());
-                    return;
-                }
-            };
+async fn handle_command(text: &str, state: &AppState) {
+    let cmd: AudioCommand = match serde_json::from_str(text) {
+        Ok(c)  => c,
+        Err(e) => { eprintln!("Bad IPC command: {}: {}", e, text); return; }
+    };
+    let tx = &state.event_tx;
 
-            println!("IPC Command: {:?}", command);
-            match command {
-                AudioCommand::Play { pad_id, file_path, volume, pan } => {
-                    if let Ok(mut eng) = ipc_engine.lock() {
-                        if let Err(e) = eng.play(pad_id, &file_path, volume, pan) {
-                            eprintln!("Error playing: {}", e);
-                        }
-                    }
-                }
-                AudioCommand::Stop { pad_id } => {
-                    if let Ok(mut eng) = ipc_engine.lock() {
-                        eng.stop(pad_id);
-                    }
-                }
-                AudioCommand::SetMasterVolume { volume } => {
-                    if let Ok(mut eng) = ipc_engine.lock() {
-                        eng.set_master_volume(volume);
-                    }
-                }
-                AudioCommand::SetPlaybackLatency { latency_ms } => {
-                    if let Ok(mut eng) = ipc_engine.lock() {
-                        eng.set_playback_latency_ms(latency_ms);
-                    }
-                }
-                AudioCommand::SetBufferSizeFrames { frames } => {
-                    if let Ok(mut eng) = ipc_engine.lock() {
-                        eng.set_buffer_size_frames(frames);
-                    }
-                }
-                AudioCommand::GetAudioSettings {} => {
-                    if let Ok(eng) = ipc_engine.lock() {
-                        let settings = eng.get_settings_snapshot();
-                        let _ = ipc_tx.send(AppEvent::AudioSettings { settings });
-                    }
-                }
-                AudioCommand::SetPlaybackBackend { backend } => {
-                    if let Ok(mut eng) = ipc_engine.lock() {
-                        eng.set_playback_backend(&backend);
-                    }
-                }
-                AudioCommand::SetPlaybackDevice { device_name } => {
-                    if let Ok(mut eng) = ipc_engine.lock() {
-                        eng.set_playback_device(&device_name);
-                    }
-                }
-                AudioCommand::GetAudioBackends {} => {
-                    let backends = available_backends();
-                    let _ = ipc_tx.send(AppEvent::AudioBackends { backends });
-                }
-                AudioCommand::GetAudioDevices { backend } => {
-                    let devices = available_output_devices(&backend);
-                    let _ = ipc_tx.send(AppEvent::AudioDevices { devices });
-                }
-                AudioCommand::Load { pad_id, file_path } => {
-                    let tx_clone = ipc_tx.clone();
-                    thread::spawn(move || {
-                        if let Ok(mut reader) = hound::WavReader::open(&file_path) {
-                            let spec = reader.spec();
-                            let duration = reader.duration() as f32 / spec.sample_rate as f32;
-
-                            let samples: Vec<f32> = match spec.sample_format {
-                                hound::SampleFormat::Float => {
-                                    reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect()
-                                }
-                                hound::SampleFormat::Int => match spec.bits_per_sample {
-                                    16 => reader
-                                        .samples::<i16>()
-                                        .map(|s| s.unwrap_or(0) as f32 / 32768.0)
-                                        .collect(),
-                                    24 => reader
-                                        .samples::<i32>()
-                                        .map(|s| s.unwrap_or(0) as f32 / 8388608.0)
-                                        .collect(),
-                                    32 => reader
-                                        .samples::<i32>()
-                                        .map(|s| s.unwrap_or(0) as f32 / 2147483648.0)
-                                        .collect(),
-                                    _ => vec![],
-                                },
-                            };
-
-                            let mono_samples: Vec<f32> = if spec.channels == 2 {
-                                samples
-                                    .chunks(2)
-                                    .map(|chunk| (chunk[0] + chunk.get(1).unwrap_or(&0.0)) / 2.0)
-                                    .collect()
-                            } else {
-                                samples
-                            };
-
-                            let total_samples = mono_samples.len();
-                            let points = 200;
-                            let chunk_size = (total_samples / points).max(1);
-                            let mut peaks = Vec::with_capacity(points);
-
-                            for chunk in mono_samples.chunks(chunk_size) {
-                                let max = chunk.iter().fold(0.0f32, |a, b| a.max(b.abs()));
-                                peaks.push(max);
-                            }
-
-                            println!(
-                                "Waveform generated: {} peaks, duration: {}s",
-                                peaks.len(),
-                                duration
-                            );
-
-                            let data = WaveformData {
-                                pad_id,
-                                peaks,
-                                duration,
-                            };
-
-                            let _ = tx_clone.send(AppEvent::WaveformReady(data));
-                        }
-                    });
-                }
-                AudioCommand::CheckUnsavedChanges => {
-                    // This is handled by frontend
-                }
-                AudioCommand::ConfirmExit => {
-                    std::process::exit(0);
-                }
-                AudioCommand::ListDirectory { path } => {
-                    let tx_clone = ipc_tx.clone();
-                    thread::spawn(move || {
-                        let dir_path = path.unwrap_or_else(|| {
-                            std::env::var("USERPROFILE")
-                                .or_else(|_| std::env::var("HOME"))
-                                .unwrap_or_else(|_| ".".to_string())
-                        });
-                        let mut entries: Vec<FsEntry> = Vec::new();
-                        if let Ok(read_dir) = std::fs::read_dir(&dir_path) {
-                            for entry in read_dir.filter_map(|e| e.ok()) {
-                                let meta = entry.metadata().ok();
-                                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                                let size = if !is_dir { meta.map(|m| m.len()) } else { None };
-                                let name = entry.file_name().to_string_lossy().to_string();
-                                let path_str = entry.path().to_string_lossy().to_string();
-                                let ext = entry.path()
-                                    .extension()
-                                    .map(|e| e.to_string_lossy().to_lowercase().to_string())
-                                    .unwrap_or_default();
-                                if is_dir || matches!(ext.as_str(), "wav" | "mp3" | "flac" | "ogg" | "aiff") {
-                                    entries.push(FsEntry { name, path: path_str, is_dir, size });
-                                }
-                            }
-                        }
-                        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-                            (true, false) => std::cmp::Ordering::Less,
-                            (false, true) => std::cmp::Ordering::Greater,
-                            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                        });
-                        let _ = tx_clone.send(AppEvent::DirectoryListing { path: dir_path, entries });
-                    });
-                }
-                AudioCommand::GetPresets {} => {
-                    let base = settings_path().join("presets");
-                    let tx_clone = ipc_tx.clone();
-                    thread::spawn(move || {
-                        let _ = std::fs::create_dir_all(&base);
-                        let mut presets: Vec<PresetInfo> = Vec::new();
-                        if let Ok(read_dir) = std::fs::read_dir(&base) {
-                            for entry in read_dir.filter_map(|e| e.ok()) {
-                                let ext = entry.path()
-                                    .extension()
-                                    .map(|e| e.to_string_lossy().to_lowercase().to_string())
-                                    .unwrap_or_default();
-                                if ext == "json" || ext == "toml" {
-                                    let name = entry.path()
-                                        .file_stem()
-                                        .map(|s| s.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    let path = entry.path().to_string_lossy().to_string();
-                                    presets.push(PresetInfo { name, path });
-                                }
-                            }
-                        }
-                        presets.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-                        let _ = tx_clone.send(AppEvent::PresetList { presets });
-                    });
-                }
-                AudioCommand::GetLibrary {} => {
-                    let base = settings_path().join("library");
-                    let tx_clone = ipc_tx.clone();
-                    thread::spawn(move || {
-                        let _ = std::fs::create_dir_all(&base);
-                        let mut entries: Vec<LibraryEntry> = Vec::new();
-                        scan_audio_dir(&base, &mut entries);
-                        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-                        let _ = tx_clone.send(AppEvent::LibraryFiles { entries });
-                    });
-                }
-                AudioCommand::GetMidiInputs {} => {
-                    let ports = list_midi_inputs();
-                    let _ = ipc_tx.send(AppEvent::MidiInputs { ports });
-                }
-                AudioCommand::SetMidiInput { port_name } => {
-                    let _ = ipc_tx.send(AppEvent::ConnectMidi { port_name });
-                }
-                AudioCommand::SetWasapiExclusive { exclusive } => {
-                    if let Ok(mut eng) = ipc_engine.lock() {
-                        eng.set_wasapi_exclusive(exclusive);
-                    }
-                }
-                AudioCommand::SetSampleRate { rate } => {
-                    if let Ok(mut eng) = ipc_engine.lock() {
-                        eng.set_sample_rate(rate);
-                    }
+    match cmd {
+        AudioCommand::Play { pad_id, file_path, volume, pan } => {
+            if let Ok(mut eng) = state.engine.lock() {
+                if let Err(e) = eng.play(pad_id, &file_path, volume, pan) {
+                    eprintln!("Play error: {}", e);
                 }
             }
-        };
-
-        let drop_tx = self.event_tx.as_ref().unwrap().clone();
-        
-        // Build webview
-        println!("[Init] Building webview...");
-
-        let webview_builder = wry::WebViewBuilder::new()
-            .with_html(&self.html_content)
-            .with_ipc_handler(handler)
-            .with_initialization_script(
-                r#"
-                console.log('[Preload] WebView initialized');
-                window.__OSMP_PRELOAD_TIME__ = Date.now();
-                "#
-            )
-            .with_drag_drop_handler(move |event| {
-                match event {
-                    wry::DragDropEvent::Drop { paths, position, .. } => {
-                        if let Some(path) = paths.first() {
-                            let path_str = path.to_string_lossy().to_string();
-                            let _ = drop_tx.send(AppEvent::FileDropped { 
-                                path: path_str, 
-                                x: position.0 as f64, 
-                                y: position.1 as f64 
-                            });
-                        }
-                    }
-                    _ => {}
+        }
+        AudioCommand::Stop { pad_id } => {
+            if let Ok(mut eng) = state.engine.lock() { eng.stop(pad_id); }
+        }
+        AudioCommand::SetMasterVolume { volume } => {
+            if let Ok(mut eng) = state.engine.lock() { eng.set_master_volume(volume); }
+        }
+        AudioCommand::SetPlaybackLatency { latency_ms } => {
+            if let Ok(mut eng) = state.engine.lock() { eng.set_playback_latency_ms(latency_ms); }
+        }
+        AudioCommand::SetBufferSizeFrames { frames } => {
+            if let Ok(mut eng) = state.engine.lock() { eng.set_buffer_size_frames(frames); }
+        }
+        AudioCommand::GetAudioSettings {} => {
+            if let Ok(eng) = state.engine.lock() {
+                let s = eng.get_settings_snapshot();
+                if let Ok(json) = serde_json::to_string(&s) {
+                    let _ = tx.send(format!(r#"{{"type":"rust-audio-settings","detail":{}}}"#, json));
                 }
-                true 
+            }
+        }
+        AudioCommand::GetAudioBackends {} => {
+            let backends = available_backends();
+            if let Ok(json) = serde_json::to_string(&backends) {
+                let _ = tx.send(format!(r#"{{"type":"rust-audio-backends","detail":{}}}"#, json));
+            }
+        }
+        AudioCommand::GetAudioDevices { backend } => {
+            let devices = available_output_devices(&backend);
+            if let Ok(json) = serde_json::to_string(&devices) {
+                let _ = tx.send(format!(r#"{{"type":"rust-audio-devices","detail":{}}}"#, json));
+            }
+        }
+        AudioCommand::SetPlaybackBackend { backend } => {
+            if let Ok(mut eng) = state.engine.lock() { eng.set_playback_backend(&backend); }
+        }
+        AudioCommand::SetPlaybackDevice { device_name } => {
+            if let Ok(mut eng) = state.engine.lock() { eng.set_playback_device(&device_name); }
+        }
+        AudioCommand::Load { pad_id, file_path } => {
+            let tx2 = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut reader) = hound::WavReader::open(&file_path) {
+                    let spec    = reader.spec();
+                    let duration = reader.duration() as f32 / spec.sample_rate as f32;
+                    let samples: Vec<f32> = match spec.sample_format {
+                        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect(),
+                        hound::SampleFormat::Int => match spec.bits_per_sample {
+                            16 => reader.samples::<i16>().map(|s| s.unwrap_or(0) as f32 / 32768.0).collect(),
+                            24 => reader.samples::<i32>().map(|s| s.unwrap_or(0) as f32 / 8388608.0).collect(),
+                            32 => reader.samples::<i32>().map(|s| s.unwrap_or(0) as f32 / 2147483648.0).collect(),
+                            _  => vec![],
+                        },
+                    };
+                    let mono: Vec<f32> = if spec.channels == 2 {
+                        samples.chunks(2).map(|c| (c[0] + c.get(1).unwrap_or(&0.0)) / 2.0).collect()
+                    } else { samples };
+                    let points     = 200usize;
+                    let chunk_size = (mono.len() / points).max(1);
+                    let peaks: Vec<f32> = mono.chunks(chunk_size)
+                        .map(|c| c.iter().fold(0.0f32, |a, &b| a.max(b.abs())))
+                        .collect();
+                    let data = WaveformData { pad_id, peaks, duration };
+                    if let Ok(json) = serde_json::to_string(&data) {
+                        let _ = tx2.send(format!(r#"{{"type":"rust-waveform-ready","detail":{}}}"#, json));
+                    }
+                }
             });
-
-        let webview = match webview_builder.build(&window) {
-            Ok(wv) => wv,
-            Err(e) => {
-                eprintln!("Failed to create webview: {}", e);
-                return;
-            }
-        };
-        
-        println!("[Init] Webview created");
-        
-        #[cfg(debug_assertions)]
-        let _ = webview.open_devtools();
-
-        self.window = Some(window);
-        self.webview = Some(webview);
-        self.is_ready = true;
-        
-        // Show window now that everything is ready
-        if let Some(window) = &self.window {
-            window.set_visible(true);
-            println!("[Init] Window shown - Total startup: {:?}", total_start.elapsed());
         }
-    }
-
-    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => {
-                // Don't close immediately, send event to check for unsaved changes
-                if let Some(tx) = &self.event_tx {
-                    let _ = tx.send(AppEvent::CloseRequested);
-                }
-            }
-            _ => (),
-        }
-    }
-    
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        let rx_opt = self.event_rx.take();
-        if let Some(ref rx) = rx_opt {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    AppEvent::FileDropped { path, x, y } => {
-                        let path_esc = path.replace("\\", "\\\\");
-                        let js = format!(
-                            "window.dispatchEvent(new CustomEvent('rust-file-drop', {{ detail: {{ path: '{}', x: {}, y: {} }} }}));", 
-                            path_esc, x, y
-                        );
-                        if let Some(webview) = &self.webview {
-                            let _ = webview.evaluate_script(&js);
-                        }
-                    },
-                    AppEvent::WaveformReady(data) => {
-                        if let Ok(json) = serde_json::to_string(&data) {
-                            let js = format!(
-                                "window.dispatchEvent(new CustomEvent('rust-waveform-ready', {{ detail: {} }}));",
-                                json
-                            );
-                            if let Some(webview) = &self.webview {
-                                let _ = webview.evaluate_script(&js);
-                            }
-                        }
-                    },
-                    AppEvent::CloseRequested => {
-                        // Check for unsaved changes and show dialog if needed
-                        if let Some(webview) = &self.webview {
-                            let js = r#"
-                                (function() {
-                                    const hasChanges = window.__hasUnsavedChanges || false;
-                                    if (hasChanges && window.__showExitDialog) {
-                                        window.__showExitDialog();
-                                    } else {
-                                        window.ipc.postMessage(JSON.stringify({ command: 'ConfirmExit' }));
-                                    }
-                                })();
-                            "#;
-                            let _ = webview.evaluate_script(js);
-                        }
-                    }
-                    AppEvent::OpenAudioSettings => {
-                        if let Some(webview) = &self.webview {
-                            let js = "window.dispatchEvent(new CustomEvent('rust-open-audio-settings'));";
-                            let _ = webview.evaluate_script(js);
-                        }
-                    }
-                    AppEvent::AudioBackends { backends } => {
-                        if let Ok(json) = serde_json::to_string(&backends) {
-                            let js = format!(
-                                "window.dispatchEvent(new CustomEvent('rust-audio-backends', {{ detail: {} }}));",
-                                json
-                            );
-                            if let Some(webview) = &self.webview {
-                                let _ = webview.evaluate_script(&js);
-                            }
-                        }
-                    }
-                    AppEvent::AudioSettings { settings } => {
-                        if let Ok(json) = serde_json::to_string(&settings) {
-                            let js = format!(
-                                "window.dispatchEvent(new CustomEvent('rust-audio-settings', {{ detail: {} }}));",
-                                json
-                            );
-                            if let Some(webview) = &self.webview {
-                                let _ = webview.evaluate_script(&js);
-                            }
-                        }
-                    }
-                    AppEvent::AudioDevices { devices } => {
-                        if let Ok(json) = serde_json::to_string(&devices) {
-                            let js = format!(
-                                "window.dispatchEvent(new CustomEvent('rust-audio-devices', {{ detail: {} }}));",
-                                json
-                            );
-                            if let Some(webview) = &self.webview {
-                                let _ = webview.evaluate_script(&js);
-                            }
-                        }
-                    }
-                    AppEvent::DirectoryListing { path, entries } => {
-                        #[derive(Serialize)]
-                        struct DirPayload { path: String, entries: Vec<FsEntry> }
-                        let payload = DirPayload { path, entries };
-                        if let Ok(json) = serde_json::to_string(&payload) {
-                            let js = format!(
-                                "window.dispatchEvent(new CustomEvent('rust-dir-listing', {{ detail: {} }}));",
-                                json
-                            );
-                            if let Some(webview) = &self.webview {
-                                let _ = webview.evaluate_script(&js);
-                            }
-                        }
-                    }
-                    AppEvent::PresetList { presets } => {
-                        if let Ok(json) = serde_json::to_string(&presets) {
-                            let js = format!(
-                                "window.dispatchEvent(new CustomEvent('rust-presets', {{ detail: {} }}));",
-                                json
-                            );
-                            if let Some(webview) = &self.webview {
-                                let _ = webview.evaluate_script(&js);
-                            }
-                        }
-                    }
-                    AppEvent::LibraryFiles { entries } => {
-                        if let Ok(json) = serde_json::to_string(&entries) {
-                            let js = format!(
-                                "window.dispatchEvent(new CustomEvent('rust-library', {{ detail: {} }}));",
-                                json
-                            );
-                            if let Some(webview) = &self.webview {
-                                let _ = webview.evaluate_script(&js);
-                            }
-                        }
-                    }
-                    AppEvent::MidiInputs { ports } => {
-                        if let Ok(json) = serde_json::to_string(&ports) {
-                            let js = format!(
-                                "window.dispatchEvent(new CustomEvent('rust-midi-inputs', {{ detail: {} }}));",
-                                json
-                            );
-                            if let Some(webview) = &self.webview {
-                                let _ = webview.evaluate_script(&js);
-                            }
-                        }
-                    }
-                    AppEvent::ConnectMidi { port_name } => {
-                        self.midi_connection = None;
-                        if let Some(name) = port_name {
-                            let tx_clone = self.event_tx.as_ref().map(|t| t.clone());
-                            if let Some(tx) = tx_clone {
-                                self.midi_connection = connect_midi_input(&name, tx);
-                                if self.midi_connection.is_some() {
-                                    println!("MIDI connected: {}", name);
-                                    if let Some(engine) = &self.audio_engine {
-                                        if let Ok(eng) = engine.lock() {
-                                            if let Ok(mut s) = eng.settings.lock() {
-                                                s.midi_input_port = Some(name);
-                                                save_settings(&s);
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    eprintln!("MIDI port not found or connect failed");
-                                }
-                            }
-                        } else {
-                            if let Some(engine) = &self.audio_engine {
-                                if let Ok(eng) = engine.lock() {
-                                    if let Ok(mut s) = eng.settings.lock() {
-                                        s.midi_input_port = None;
-                                        save_settings(&s);
-                                    }
-                                }
-                            }
-                            println!("MIDI input disconnected");
-                        }
-                    }
-                    AppEvent::MidiNote { note, velocity, channel } => {
-                        let js = format!(
-                            "window.dispatchEvent(new CustomEvent('rust-midi-note', {{ detail: {{ note: {}, velocity: {}, channel: {} }} }}));",
-                            note, velocity, channel
-                        );
-                        if let Some(webview) = &self.webview {
-                            let _ = webview.evaluate_script(&js);
+        AudioCommand::CheckUnsavedChanges => { /* handled in frontend */ }
+        AudioCommand::ConfirmExit => { std::process::exit(0); }
+        AudioCommand::ListDirectory { path } => {
+            let tx2 = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let dir = path.unwrap_or_else(|| {
+                    std::env::var("HOME")
+                        .or_else(|_| std::env::var("USERPROFILE"))
+                        .unwrap_or_else(|_| ".".to_string())
+                });
+                let mut entries: Vec<FsEntry> = Vec::new();
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for e in rd.filter_map(|e| e.ok()) {
+                        let meta  = e.metadata().ok();
+                        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                        let size  = if !is_dir { meta.map(|m| m.len()) } else { None };
+                        let name  = e.file_name().to_string_lossy().to_string();
+                        let path  = e.path().to_string_lossy().to_string();
+                        let ext   = e.path().extension().map(|x| x.to_string_lossy().to_lowercase().to_string()).unwrap_or_default();
+                        if is_dir || matches!(ext.as_str(), "wav" | "mp3" | "flac" | "ogg" | "aiff") {
+                            entries.push(FsEntry { name, path, is_dir, size });
                         }
                     }
                 }
+                entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                });
+                #[derive(Serialize)]
+                struct DirPayload { path: String, entries: Vec<FsEntry> }
+                let payload = DirPayload { path: dir, entries };
+                if let Ok(json) = serde_json::to_string(&payload) {
+                    let _ = tx2.send(format!(r#"{{"type":"rust-dir-listing","detail":{}}}"#, json));
+                }
+            });
+        }
+        AudioCommand::GetPresets {} => {
+            let tx2  = tx.clone();
+            let base = settings_path().join("presets");
+            tokio::task::spawn_blocking(move || {
+                let _ = std::fs::create_dir_all(&base);
+                let mut presets: Vec<PresetInfo> = Vec::new();
+                if let Ok(rd) = std::fs::read_dir(&base) {
+                    for e in rd.filter_map(|e| e.ok()) {
+                        let ext = e.path().extension().map(|x| x.to_string_lossy().to_lowercase().to_string()).unwrap_or_default();
+                        if ext == "json" || ext == "toml" {
+                            let name = e.path().file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                            let path = e.path().to_string_lossy().to_string();
+                            presets.push(PresetInfo { name, path });
+                        }
+                    }
+                }
+                presets.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                if let Ok(json) = serde_json::to_string(&presets) {
+                    let _ = tx2.send(format!(r#"{{"type":"rust-presets","detail":{}}}"#, json));
+                }
+            });
+        }
+        AudioCommand::GetLibrary {} => {
+            let tx2  = tx.clone();
+            let base = settings_path().join("library");
+            tokio::task::spawn_blocking(move || {
+                let _ = std::fs::create_dir_all(&base);
+                let mut entries: Vec<LibraryEntry> = Vec::new();
+                scan_audio_dir(&base, &mut entries);
+                entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                if let Ok(json) = serde_json::to_string(&entries) {
+                    let _ = tx2.send(format!(r#"{{"type":"rust-library","detail":{}}}"#, json));
+                }
+            });
+        }
+        AudioCommand::GetMidiInputs {} => {
+            let ports = list_midi_inputs();
+            if let Ok(json) = serde_json::to_string(&ports) {
+                let _ = tx.send(format!(r#"{{"type":"rust-midi-inputs","detail":{}}}"#, json));
             }
         }
-        self.event_rx = rx_opt;
+        AudioCommand::SetMidiInput { port_name } => {
+            let mut conn_guard = state.midi_conn.lock().unwrap();
+            *conn_guard = None;
+            if let Some(ref name) = port_name {
+                let tx2 = tx.clone();
+                if let Some(conn) = connect_midi_input(name, tx2) {
+                    *conn_guard = Some(conn);
+                    println!("MIDI connected: {}", name);
+                    if let Ok(eng) = state.engine.lock() {
+                        if let Ok(mut s) = eng.settings.lock() {
+                            s.midi_input_port = port_name;
+                            save_settings(&s);
+                        }
+                    }
+                } else {
+                    eprintln!("MIDI connect failed: {}", name);
+                }
+            } else {
+                if let Ok(eng) = state.engine.lock() {
+                    if let Ok(mut s) = eng.settings.lock() {
+                        s.midi_input_port = None;
+                        save_settings(&s);
+                    }
+                }
+                println!("MIDI disconnected");
+            }
+        }
+        AudioCommand::SetWasapiExclusive { exclusive } => {
+            #[cfg(target_os = "windows")]
+            if let Ok(mut eng) = state.engine.lock() {
+                eng.set_wasapi_exclusive(exclusive);
+            }
+            #[cfg(not(target_os = "windows"))]
+            eprintln!("SetWasapiExclusive ignored on non-Windows (exclusive={})", exclusive);
+        }
+        AudioCommand::SetSampleRate { rate } => {
+            if let Ok(mut eng) = state.engine.lock() { eng.set_sample_rate(rate); }
+        }
     }
 }
+
+// ── MIDI helpers ──────────────────────────────────────────────────────────────
 
 fn list_midi_inputs() -> Vec<String> {
     match MidiInput::new("osmpdrum-list") {
-        Ok(midi_in) => midi_in
-            .ports()
-            .iter()
+        Ok(midi_in) => midi_in.ports().iter()
             .filter_map(|p| midi_in.port_name(p).ok())
             .collect(),
         Err(_) => Vec::new(),
@@ -1480,34 +1116,27 @@ fn list_midi_inputs() -> Vec<String> {
 
 fn connect_midi_input(
     port_name: &str,
-    tx: Sender<AppEvent>,
+    tx: broadcast::Sender<String>,
 ) -> Option<MidiInputConnection<()>> {
     let midi_in = MidiInput::new("osmpdrum").ok()?;
-    let ports = midi_in.ports();
-    let port = ports
-        .iter()
-        .find(|p| midi_in.port_name(p).ok().as_deref() == Some(port_name))?;
-    midi_in
-        .connect(
-            port,
-            "osmpdrum-in",
-            move |_ts, data, _| {
-                if data.len() >= 3 {
-                    let kind = data[0] & 0xF0;
-                    let channel = data[0] & 0x0F;
-                    if kind == 0x90 && data[2] > 0 {
-                        let _ = tx.send(AppEvent::MidiNote {
-                            note: data[1],
-                            velocity: data[2],
-                            channel,
-                        });
-                    }
-                }
-            },
-            (),
-        )
-        .ok()
+    let ports   = midi_in.ports();
+    let port    = ports.iter().find(|p| midi_in.port_name(p).ok().as_deref() == Some(port_name))?;
+    midi_in.connect(port, "osmpdrum-in", move |_ts, data, _| {
+        if data.len() >= 3 {
+            let kind    = data[0] & 0xF0;
+            let channel = data[0] & 0x0F;
+            if kind == 0x90 && data[2] > 0 {
+                let msg = format!(
+                    r#"{{"type":"rust-midi-note","detail":{{"note":{},"velocity":{},"channel":{}}}}}"#,
+                    data[1], data[2], channel
+                );
+                let _ = tx.send(msg);
+            }
+        }
+    }, ()).ok()
 }
+
+// ── Filesystem helpers ────────────────────────────────────────────────────────
 
 fn scan_audio_dir(dir: &std::path::Path, entries: &mut Vec<LibraryEntry>) {
     if let Ok(read_dir) = std::fs::read_dir(dir) {
@@ -1518,10 +1147,8 @@ fn scan_audio_dir(dir: &std::path::Path, entries: &mut Vec<LibraryEntry>) {
             } else if let Some(ext_os) = path.extension() {
                 let ext = ext_os.to_string_lossy().to_lowercase();
                 if matches!(ext.as_str(), "wav" | "mp3" | "flac" | "ogg" | "aiff") {
-                    let name = path.file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    let name     = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let size     = entry.metadata().map(|m| m.len()).unwrap_or(0);
                     let path_str = path.to_string_lossy().to_string();
                     entries.push(LibraryEntry { name, path: path_str, size, ext: ext.to_string() });
                 }
@@ -1530,12 +1157,54 @@ fn scan_audio_dir(dir: &std::path::Path, entries: &mut Vec<LibraryEntry>) {
     }
 }
 
-fn main() -> Result<()> {
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("Panic: {}", info);
-    }));
-    let event_loop = EventLoop::new()?;
-    let mut app = App::new()?;
-    event_loop.run_app(&mut app)?;
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    std::panic::set_hook(Box::new(|info| eprintln!("Panic: {}", info)));
+
+    println!("osmpdrum server starting...");
+
+    let engine = AudioEngine::new()?;
+    let engine = Arc::new(Mutex::new(engine));
+
+    let (event_tx, _) = broadcast::channel::<String>(256);
+    let midi_conn: Arc<Mutex<Option<MidiInputConnection<()>>>> = Arc::new(Mutex::new(None));
+
+    // Reconnect saved MIDI port on startup
+    {
+        let saved = engine.lock().unwrap().get_settings_snapshot().midi_input_port.clone();
+        if let Some(ref port) = saved {
+            let tx = event_tx.clone();
+            if let Some(conn) = connect_midi_input(port, tx) {
+                *midi_conn.lock().unwrap() = Some(conn);
+                println!("MIDI auto-connected: {}", port);
+            }
+        }
+    }
+
+    let state = AppState { engine, event_tx: event_tx.clone(), midi_conn };
+
+    println!("Serving embedded frontend ({} bytes)", FRONTEND_HTML.len());
+
+    let app = Router::new()
+        .route("/ws", get(ws_handler))
+        .fallback(serve_frontend)
+        .layer(CorsLayer::permissive())
+        .with_state(state);
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 7878));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("Listening on http://{}", addr);
+
+    // Open browser after a short delay so the listener is ready
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Err(e) = open::that("http://127.0.0.1:7878") {
+            eprintln!("Could not open browser: {}", e);
+        }
+    });
+
+    axum::serve(listener, app).await?;
     Ok(())
 }

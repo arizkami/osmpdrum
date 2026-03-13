@@ -13,6 +13,9 @@ interface PadGridProps {
     onCopyPadTo?: (fromId: number, toId: number) => void;
     onClearPad?: (id: number) => void;
     onPathDrop?: (padId: number, path: string) => void;
+    viewMode?: 'pad' | 'drum';
+    onToggleViewMode?: () => void;
+    padKeys?: (string | null)[];
 }
 
 const KEY_HINTS = [
@@ -31,6 +34,9 @@ const ROW_CONFIGS = [
 export const PadGrid: React.FC<PadGridProps> = ({
     pads, onSelect, onToggle, onPlay,
     onFileLoadToPad, onSwapPads, onCopyPadTo, onClearPad, onPathDrop,
+    viewMode = 'pad',
+    onToggleViewMode,
+    padKeys,
 }) => {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; padId: number } | null>(null);
     const [dragOverPadId, setDragOverPadId] = useState<number | null>(null);
@@ -174,6 +180,15 @@ export const PadGrid: React.FC<PadGridProps> = ({
                         ))}
                     </div>
                     <div className="flex-1" />
+                    {onToggleViewMode && (
+                        <button
+                            type="button"
+                            onClick={onToggleViewMode}
+                            className="h-5 px-2 rounded text-[9px] font-bold uppercase tracking-widest border border-[#1f1f1f] bg-[#0a0a0a] text-[#4a4a4a] hover:text-[#7df9ff] hover:border-[#2a2a2a]"
+                        >
+                            {viewMode === 'pad' ? 'View more' : 'Pad View'}
+                        </button>
+                    )}
                     {draggingPadId !== null && (
                         <span className="text-[8px] font-mono text-[#333] uppercase tracking-wider">
                             drag to swap
@@ -203,7 +218,7 @@ export const PadGrid: React.FC<PadGridProps> = ({
 
                                 {/* 8 pads */}
                                 {rowPads.map((pad) => {
-                                    const keyHint = KEY_HINTS[pad.id];
+                                    const keyHint = padKeys ? (padKeys[pad.id] ?? null) : KEY_HINTS[pad.id] ?? null;
                                     const isDragOver  = dragOverPadId === pad.id;
                                     const isDragging  = draggingPadId === pad.id;
                                     const isSwapTarget = isPadSwapTarget(pad.id);
@@ -327,7 +342,7 @@ export const PadGrid: React.FC<PadGridProps> = ({
                                             {keyHint && (
                                                 <div className="absolute bottom-1 right-1.5 text-[7px] font-mono leading-none pointer-events-none"
                                                     style={{ color: pad.isActive ? row.accent + '40' : '#242424' }}>
-                                                    {keyHint}
+                                                    {keyHint.toUpperCase()}
                                                 </div>
                                             )}
 

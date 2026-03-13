@@ -1,13 +1,16 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Layout, Music, Settings, HelpCircle, FileAudio } from 'lucide-react';
+import { Layout, Music, Settings, HelpCircle, FileAudio, Keyboard } from 'lucide-react';
 import { WaveformDisplay } from './components/WaveformDisplay';
 import { Knob } from './components/Knob';
 import { PadGrid } from './components/PadGrid';
+import { DrumView } from './components/DrumView';
+import { MidiSettings } from './components/MidiSettings';
 import { EffectsRack } from './components/EffectsRack';
 import { Dialog, DialogFooter, DialogButton } from './components/Dialog';
 import { DropdownMenu } from './components/DropdownMenu';
 import { MenuSelect } from './components/MenuSelect';
 import { VUMeter } from './components/VUMeter';
+
 import { Sidebar } from './components/Sidebar';
 import { PadData } from './types';
 import { audioEngine } from './lib/audioEngine';
@@ -15,13 +18,38 @@ import { audioEngine } from './lib/audioEngine';
 // don't remove logo and skip error!
 import Logo from './assets/logo.svg';
 
+const DEFAULT_KEY_MAP: Record<string, number> = {
+  'q': 0, 'w': 1, 'e': 2, 'r': 3, 't': 4, 'y': 5, 'u': 6, 'i': 7,
+  'a': 8, 's': 9, 'd': 10, 'f': 11, 'g': 12, 'h': 13, 'j': 14, 'k': 15,
+  'z': 16, 'x': 17, 'c': 18, 'v': 19, 'b': 20, 'n': 21, 'm': 22, ',': 23,
+};
+
 const App: React.FC = () => {
   const [selectedPadId, setSelectedPadId] = useState<number>(0);
+  const [viewMode, setViewMode] = useState<'pad' | 'drum'>('pad');
+  const [padMidiNotes, setPadMidiNotes] = useState<number[]>(
+    Array.from({ length: 32 }, (_, i) => i + 36)
+  );
+  const [padKeys, setPadKeys] = useState<(string | null)[]>(() => {
+    const arr: (string | null)[] = Array(32).fill(null);
+    Object.entries(DEFAULT_KEY_MAP).forEach(([k, pid]) => { arr[pid] = k; });
+    return arr;
+  });
+  const [showMidiSettings, setShowMidiSettings] = useState(false);
+  const [midiSettingsTab, setMidiSettingsTab] = useState<'midi' | 'key'>('midi');
+
+  const openMidiSettings = (tab: 'midi' | 'key' = 'midi') => {
+    setMidiSettingsTab(tab);
+    setShowMidiSettings(true);
+  };
+  const midiMapRef = useRef<Record<number, number>>({});
+  const keyMapRef = useRef<Record<string, number>>({});
   const [isPlaying, setIsPlaying] = useState(false);
   const [playProgress, setPlayProgress] = useState(0);
   const [masterVolume, setMasterVolume] = useState(100);
   const [playbackLatencyMs, setPlaybackLatencyMs] = useState(50);
   const [showAudioSettings, setShowAudioSettings] = useState(false);
+
   const [audioBackends, setAudioBackends] = useState<string[]>([]);
   const [selectedBackend, setSelectedBackend] = useState<string>('');
   const [audioDevices, setAudioDevices] = useState<string[]>([]);
@@ -62,6 +90,18 @@ const App: React.FC = () => {
     setPlaybackLatencyMs(clamped);
     audioEngine.setPlaybackLatency(clamped);
   }, []);
+
+  useEffect(() => {
+    const map: Record<number, number> = {};
+    padMidiNotes.forEach((note, padId) => { map[note] = padId; });
+    midiMapRef.current = map;
+  }, [padMidiNotes]);
+
+  useEffect(() => {
+    const map: Record<string, number> = {};
+    padKeys.forEach((key, padId) => { if (key) map[key.toLowerCase()] = padId; });
+    keyMapRef.current = map;
+  }, [padKeys]);
 
   const openAudioSettings = () => {
     setShowAudioSettings(true);
@@ -284,8 +324,8 @@ const App: React.FC = () => {
 
     const handleMidiNote = (e: CustomEvent) => {
       const { note } = e.detail as { note: number; velocity: number; channel: number };
-      const padId = note - 36;
-      if (padId >= 0 && padId < 32) {
+      const padId = midiMapRef.current[note];
+      if (padId !== undefined) {
         playPad(padId);
       }
     };
@@ -498,13 +538,7 @@ const App: React.FC = () => {
   // Keyboard support
   useEffect(() => {
     const handleKeyPress = (e: KeyboardEvent) => {
-      const keyMap: { [key: string]: number } = {
-        'q': 0, 'w': 1, 'e': 2, 'r': 3, 't': 4, 'y': 5, 'u': 6, 'i': 7,
-        'a': 8, 's': 9, 'd': 10, 'f': 11, 'g': 12, 'h': 13, 'j': 14, 'k': 15,
-        'z': 16, 'x': 17, 'c': 18, 'v': 19, 'b': 20, 'n': 21, 'm': 22, ',': 23
-      };
-
-      const padId = keyMap[e.key.toLowerCase()];
+      const padId = keyMapRef.current[e.key.toLowerCase()];
       if (padId !== undefined) {
         playPad(padId);
       }
@@ -513,6 +547,31 @@ const App: React.FC = () => {
     window.addEventListener('keydown', handleKeyPress);
     return () => window.removeEventListener('keydown', handleKeyPress);
   }, [pads]);
+
+  const handleChangeMidiNote = (padId: number, note: number) => {
+    setPadMidiNotes(prev => { const n = [...prev]; n[padId] = note; return n; });
+  };
+
+  const handleChangeKey = (padId: number, key: string | null) => {
+    setPadKeys(prev => {
+      const n = [...prev];
+      if (key !== null) {
+        n.forEach((k, i) => { if (k?.toLowerCase() === key.toLowerCase()) n[i] = null; });
+      }
+      n[padId] = key;
+      return n;
+    });
+  };
+
+  const handleResetMidi = () => {
+    setPadMidiNotes(Array.from({ length: 32 }, (_, i) => i + 36));
+  };
+
+  const handleResetKeys = () => {
+    const arr: (string | null)[] = Array(32).fill(null);
+    Object.entries(DEFAULT_KEY_MAP).forEach(([k, pid]) => { arr[pid] = k; });
+    setPadKeys(arr);
+  };
 
   const selectedPad = pads[selectedPadId];
 
@@ -566,8 +625,29 @@ const App: React.FC = () => {
             ]}
           />
           <DropdownMenu
+            label="MAPPING"
+            items={[
+              {
+                label: 'MIDI Notes\u2026',
+                onClick: () => openMidiSettings('midi'),
+                icon: <Music size={14} />,
+              },
+              {
+                label: 'Keyboard Keys\u2026',
+                onClick: () => openMidiSettings('key'),
+                icon: <Keyboard size={14} />,
+              },
+            ]}
+          />
+          <DropdownMenu
             label="TOOL"
             items={[
+              {
+                label: 'MIDI Keymap\u2026',
+                onClick: () => openMidiSettings('midi'),
+                icon: <Keyboard size={14} />,
+              },
+              { divider: true } as any,
               {
                 label: 'Open Mixer',
                 onClick: () => {},
@@ -588,6 +668,18 @@ const App: React.FC = () => {
             ]}
           />
         </nav>
+
+        {/* Right-side header actions */}
+        <div className="ml-auto flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => openMidiSettings('midi')}
+            className="flex items-center gap-1.5 h-6 px-2.5 text-[10px] font-bold uppercase tracking-widest rounded border border-[#1c1c1c] text-[#3a3a3a] hover:text-[#7df9ff] hover:border-[#7df9ff22] hover:bg-[#0a1415] transition-colors"
+          >
+            <Keyboard size={11} />
+            MIDI Map
+          </button>
+        </div>
       </header>
 
       <div className="flex flex-1 overflow-hidden">
@@ -630,26 +722,10 @@ const App: React.FC = () => {
               <div className="bg-[#161616] text-text-muted text-[10px] h-7 font-bold px-2.5 py-1 border-b border-[#1e1e1e] uppercase tracking-widest flex items-center">
                 Envelope Generator
               </div>
-
               <div className="flex items-center justify-around flex-1 px-2 pb-2">
-                <Knob
-                  label="Attack"
-                  value={envelope.attack}
-                  onChange={(v) => setEnvelope(e => ({ ...e, attack: v }))}
-                  suffix="ms"
-                />
-                <Knob
-                  label="Decay"
-                  value={envelope.decay}
-                  onChange={(v) => setEnvelope(e => ({ ...e, decay: v }))}
-                  suffix="ms"
-                />
-                <Knob
-                  label="Sustain"
-                  value={envelope.sustain}
-                  onChange={(v) => setEnvelope(e => ({ ...e, sustain: v }))}
-                  suffix="%"
-                />
+                <Knob label="Attack"  value={envelope.attack}  onChange={(v) => setEnvelope(e => ({ ...e, attack: v }))}  suffix="ms" />
+                <Knob label="Decay"   value={envelope.decay}   onChange={(v) => setEnvelope(e => ({ ...e, decay: v }))}   suffix="ms" />
+                <Knob label="Sustain" value={envelope.sustain} onChange={(v) => setEnvelope(e => ({ ...e, sustain: v }))} suffix="%" />
               </div>
             </div>
 
@@ -661,9 +737,9 @@ const App: React.FC = () => {
               <div className="p-3 flex flex-col gap-2.5">
                 {[
                   { label: 'Root Note', value: 'C3' },
-                  { label: 'Tune', value: '+0 st' },
-                  { label: 'Pitch', value: '0.00' },
-                  { label: 'Pan', value: 'C' },
+                  { label: 'Tune',      value: '+0 st' },
+                  { label: 'Pitch',     value: '0.00' },
+                  { label: 'Pan',       value: 'C' },
                 ].map(({ label, value }) => (
                   <div key={label} className="flex justify-between items-center">
                     <span className="text-[10px] text-gray-600 uppercase tracking-wider">{label}</span>
@@ -683,28 +759,43 @@ const App: React.FC = () => {
                   <VUMeter level={vuLevel} width={48} height={60} />
                   <span className="text-[9px] font-bold text-gray-600 uppercase tracking-widest">VU</span>
                 </div>
-                <Knob
-                  label="Master"
-                  value={masterVolume}
-                  onChange={handleMasterVolumeChange}
-                  suffix="%"
-                />
+                <Knob label="Master" value={masterVolume} onChange={handleMasterVolumeChange} suffix="%" />
               </div>
             </div>
           </div>
 
           {/* Pads Grid */}
-          <PadGrid
-            pads={pads}
-            onSelect={handlePadSelect}
-            onToggle={handlePadToggle}
-            onPlay={playPad}
-            onFileLoadToPad={handleFileLoadToPad as any}
-            onSwapPads={handleSwapPads}
-            onCopyPadTo={handleCopyPadTo}
-            onClearPad={handleClearPad}
-            onPathDrop={handlePathDrop}
-          />
+          {viewMode === 'pad' ? (
+            <PadGrid
+              pads={pads}
+              onSelect={handlePadSelect}
+              onToggle={handlePadToggle}
+              onPlay={playPad}
+              onFileLoadToPad={handleFileLoadToPad as any}
+              onSwapPads={handleSwapPads}
+              onCopyPadTo={handleCopyPadTo}
+              onClearPad={handleClearPad}
+              onPathDrop={handlePathDrop}
+              viewMode={viewMode}
+              onToggleViewMode={() => setViewMode('drum')}
+              padKeys={padKeys}
+            />
+          ) : (
+            <div className="flex-1 flex flex-col min-h-0 bg-[#080808]">
+              <div className="h-7 flex items-center px-3 gap-3 shrink-0 border-t border-b border-[#171717]">
+                <button
+                  type="button"
+                  onClick={() => setViewMode('pad')}
+                  className="h-5 px-2 rounded text-[9px] font-bold uppercase tracking-widest border border-[#1f1f1f] bg-[#0a0a0a] text-[#4a4a4a] hover:text-[#7df9ff] hover:border-[#2a2a2a]"
+                >
+                  Pad View
+                </button>
+                <div className="flex-1" />
+                <span className="text-[9px] font-mono text-[#2e2e2e]">View more</span>
+              </div>
+              <DrumView pads={pads} onSelect={handlePadSelect} onPlay={playPad} />
+            </div>
+          )}
 
           {/* Bottom Effects Rack */}
           <EffectsRack />
@@ -712,138 +803,84 @@ const App: React.FC = () => {
         </main>
       </div>
 
+      <MidiSettings
+        isOpen={showMidiSettings}
+        onClose={() => setShowMidiSettings(false)}
+        pads={pads}
+        padMidiNotes={padMidiNotes}
+        padKeys={padKeys}
+        onChangeMidiNote={handleChangeMidiNote}
+        onChangeKey={handleChangeKey}
+        onResetMidi={handleResetMidi}
+        onResetKeys={handleResetKeys}
+        defaultTab={midiSettingsTab}
+      />
+
       {/* Exit Confirmation Dialog */}
-      <Dialog
-        isOpen={showExitDialog}
-        onClose={handleCancelExit}
-        title="Unsaved Changes"
-        size="sm"
-      >
+      <Dialog isOpen={showExitDialog} onClose={handleCancelExit} title="Unsaved Changes" size="sm">
         <p className="mb-4 text-text-muted leading-relaxed">
           You have unsaved changes. Are you sure you want to exit?
         </p>
         <DialogFooter>
-          <DialogButton onClick={handleCancelExit} variant="secondary">
-            Cancel
-          </DialogButton>
-          <DialogButton onClick={handleConfirmExit} variant="danger">
-            Exit Without Saving
-          </DialogButton>
+          <DialogButton onClick={handleCancelExit} variant="secondary">Cancel</DialogButton>
+          <DialogButton onClick={handleConfirmExit} variant="danger">Exit Without Saving</DialogButton>
         </DialogFooter>
       </Dialog>
 
-      <Dialog
-        isOpen={showAudioSettings}
-        onClose={() => setShowAudioSettings(false)}
-        title="Audio Settings"
-        size="md"
-      >
+      <Dialog isOpen={showAudioSettings} onClose={() => setShowAudioSettings(false)} title="Audio Settings" size="md">
         <div className="space-y-4">
           <div>
-            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">
-              Playback API
-            </div>
-            <MenuSelect
-              value={selectedBackend}
-              placeholder="(No backends reported)"
-              items={audioBackends.map(b => ({ label: b, value: b }))}
-              onChange={(v) => applyBackend(v)}
-            />
+            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">Playback API</div>
+            <MenuSelect value={selectedBackend} placeholder="(No backends reported)"
+              items={audioBackends.map(b => ({ label: b, value: b }))} onChange={(v) => applyBackend(v)} />
           </div>
-
           <div>
-            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">
-              Output Device
-            </div>
-            <MenuSelect
-              value={selectedDevice}
-              placeholder="(No devices reported)"
-              items={audioDevices.map(d => ({ label: d, value: d }))}
-              onChange={(v) => applyDevice(v)}
-            />
+            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">Output Device</div>
+            <MenuSelect value={selectedDevice} placeholder="(No devices reported)"
+              items={audioDevices.map(d => ({ label: d, value: d }))} onChange={(v) => applyDevice(v)} />
           </div>
-
           <div>
-            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">
-              Buffer size (frames)
-            </div>
-            <MenuSelect
-              value={String(bufferSizeFrames)}
-              placeholder="Auto"
+            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">Buffer size (frames)</div>
+            <MenuSelect value={String(bufferSizeFrames)} placeholder="Auto"
               items={[
-                { label: 'Auto', value: '0' },
-                { label: '64', value: '64' },
-                { label: '128', value: '128' },
-                { label: '256', value: '256' },
-                { label: '512', value: '512' },
-                { label: '1024', value: '1024' },
-                { label: '2048', value: '2048' },
-                { label: '4096', value: '4096' },
-                { label: '8192', value: '8192' },
+                { label: 'Auto', value: '0' }, { label: '64', value: '64' }, { label: '128', value: '128' },
+                { label: '256', value: '256' }, { label: '512', value: '512' }, { label: '1024', value: '1024' },
+                { label: '2048', value: '2048' }, { label: '4096', value: '4096' }, { label: '8192', value: '8192' },
               ]}
-              onChange={(v) => applyBufferFrames(Number(v))}
-            />
+              onChange={(v) => applyBufferFrames(Number(v))} />
             <div className="mt-2 text-[11px] text-text-muted leading-relaxed">
               Set to 0 for auto (uses latency). Setting an explicit frame size overrides latency.
             </div>
           </div>
-
           <div>
-            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">
-              Sample Rate
-            </div>
-            <MenuSelect
-              value={String(sampleRate)}
-              placeholder="Device default"
+            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">Sample Rate</div>
+            <MenuSelect value={String(sampleRate)} placeholder="Device default"
               items={[
-                { label: 'Device default', value: '0' },
-                { label: '44100 Hz', value: '44100' },
-                { label: '48000 Hz', value: '48000' },
-                { label: '96000 Hz', value: '96000' },
+                { label: 'Device default', value: '0' }, { label: '44100 Hz', value: '44100' },
+                { label: '48000 Hz', value: '48000' }, { label: '96000 Hz', value: '96000' },
               ]}
-              onChange={(v) => applySampleRate(Number(v))}
-            />
+              onChange={(v) => applySampleRate(Number(v))} />
             <div className="mt-2 text-[11px] text-text-muted leading-relaxed">
               Custom rates require WASAPI Exclusive mode.
             </div>
           </div>
-
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted">
-                WASAPI Exclusive Mode
-              </div>
-              <div className="mt-1 text-[11px] text-text-muted leading-relaxed">
-                Direct hardware access for minimum latency.
-              </div>
+              <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted">WASAPI Exclusive Mode</div>
+              <div className="mt-1 text-[11px] text-text-muted leading-relaxed">Direct hardware access for minimum latency.</div>
             </div>
             <button
               onClick={() => applyWasapiExclusive(!wasapiExclusive)}
-              className={`w-10 h-5 rounded-full transition-colors shrink-0 ml-4 ${
-                wasapiExclusive ? 'bg-accent-cyan' : 'bg-[#2a2a2a]'
-              }`}
+              className={`w-10 h-5 rounded-full transition-colors shrink-0 ml-4 ${wasapiExclusive ? 'bg-accent-cyan' : 'bg-[#2a2a2a]'}`}
             >
-              <span
-                className={`block w-4 h-4 rounded-full bg-white shadow mx-0.5 transition-transform ${
-                  wasapiExclusive ? 'translate-x-5' : 'translate-x-0'
-                }`}
-              />
+              <span className={`block w-4 h-4 rounded-full bg-white shadow mx-0.5 transition-transform ${wasapiExclusive ? 'translate-x-5' : 'translate-x-0'}`} />
             </button>
           </div>
-
           <div>
-            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">
-              MIDI Input Device
-            </div>
-            <MenuSelect
-              value={selectedMidiInput}
-              placeholder="(No MIDI inputs detected)"
-              items={[
-                { label: '— None —', value: '' },
-                ...midiInputPorts.map(p => ({ label: p, value: p })),
-              ]}
-              onChange={(v) => applyMidiInput(v)}
-            />
+            <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">MIDI Input Device</div>
+            <MenuSelect value={selectedMidiInput} placeholder="(No MIDI inputs detected)"
+              items={[{ label: '— None —', value: '' }, ...midiInputPorts.map(p => ({ label: p, value: p }))]}
+              onChange={(v) => applyMidiInput(v)} />
             <div className="mt-2 text-[11px] text-text-muted leading-relaxed">
               MIDI notes 36–67 trigger pads 1–32 (GM drum map).
             </div>
