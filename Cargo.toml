@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "host",
+    "crates/osmpcore",
+    "crates/osmpdsp",
+]
+resolver = "2"
