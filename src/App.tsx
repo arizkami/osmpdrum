@@ -1,9 +1,13 @@
-import React, { useState, useRef, useEffect } from 'react';
+﻿import React, { useState, useRef, useEffect } from 'react';
 import { Layout, Music, Settings, HelpCircle, FileAudio, Keyboard } from 'lucide-react';
 import { WaveformDisplay } from './components/WaveformDisplay';
 import { Knob } from './components/Knob';
 import { PadGrid } from './components/PadGrid';
 import { DrumView } from './components/DrumView';
+import { OsmpBar, OsmpInfo } from './components/OsmpBar';
+import { OsmpPadProps } from './components/OsmpPadProps';
+import { FileBrowser } from './components/FileBrowser';
+import type { OsmpZonesData } from './types/osmp';
 import { MidiSettings } from './components/MidiSettings';
 import { EffectsRack } from './components/EffectsRack';
 import { Dialog, DialogFooter, DialogButton } from './components/Dialog';
@@ -64,6 +68,21 @@ const App: React.FC = () => {
   const [vuLevel, setVuLevel] = useState(0);
   const animationFrameRef = useRef<number>(0);
   const playStartTimeRef = useRef<number>(0);
+
+  const [showProjectBrowser, setShowProjectBrowser] = useState(false);
+
+  // OSMP zones + CC state
+  const [osmpZones, setOsmpZones] = useState<OsmpZonesData | null>(null);
+  const [osmpCcState, setOsmpCcState] = useState<Record<string, number>>({});
+
+  // OSMP state
+  const [osmpFilePath, setOsmpFilePath] = useState('');
+  const [osmpInfo, setOsmpInfo] = useState<OsmpInfo | null>(null);
+  const [osmpLoading, setOsmpLoading] = useState(false);
+  const [osmpError, setOsmpError] = useState<string | null>(null);
+  const [osmpVelocity, setOsmpVelocity] = useState(100);
+  const [osmpWarmed, setOsmpWarmed] = useState(false);
+  const [osmpWarming, setOsmpWarming] = useState(false);
 
   const safeGetLocalStorageNumber = (key: string): number | undefined => {
     try {
@@ -213,6 +232,131 @@ const App: React.FC = () => {
       audioEngine.getAudioDevices(selectedBackend);
     }
   }, [showAudioSettings, selectedBackend]);
+
+  // OSMP event listeners
+  useEffect(() => {
+    const onLoaded = (e: CustomEvent) => {
+      setOsmpInfo(e.detail as OsmpInfo);
+      setOsmpLoading(false);
+      setOsmpError(null);
+      setOsmpWarmed(false);
+    };
+    const onError = (e: CustomEvent) => {
+      setOsmpError((e.detail as any)?.error ?? 'Unknown error');
+      setOsmpLoading(false);
+    };
+    const onInfo = (e: CustomEvent) => {
+      const d = e.detail as any;
+      if (d?.name) setOsmpInfo(d as OsmpInfo);
+    };
+    const onZones = (e: CustomEvent) => {
+      const data = e.detail as OsmpZonesData | null;
+      if (!data) return;
+      setOsmpZones(data);
+      // Build initial CC state from cc_state array
+      const ccMap: Record<string, number> = {};
+      data.cc_state.forEach(([num, val]) => { ccMap[String(num)] = val; });
+      setOsmpCcState(ccMap);
+      // Auto-map pads: assign MIDI notes from pad_slots
+      if (data.pad_slots.length > 0) {
+        setPadMidiNotes(prev => {
+          const next = [...prev];
+          data.pad_slots.forEach((slot, i) => { if (i < next.length) next[i] = slot.note; });
+          return next;
+        });
+        // Auto-set pad labels from zone labels
+        setPads(prev => prev.map((p, i) => {
+          const slot = data.pad_slots[i];
+          if (!slot) return p;
+          return { ...p, label: slot.label };
+        }));
+      }
+    };
+    window.addEventListener('rust-osmp-loaded', onLoaded as any);
+    window.addEventListener('rust-osmp-error', onError as any);
+    window.addEventListener('rust-osmp-info', onInfo as any);
+    window.addEventListener('rust-osmp-zones', onZones as any);
+    audioEngine.getOsmpInfo();
+    return () => {
+      window.removeEventListener('rust-osmp-loaded', onLoaded as any);
+      window.removeEventListener('rust-osmp-error', onError as any);
+      window.removeEventListener('rust-osmp-info', onInfo as any);
+      window.removeEventListener('rust-osmp-zones', onZones as any);
+    };
+  }, []);
+
+  const handleOsmpLoad = () => {
+    if (!osmpFilePath.trim()) return;
+    setOsmpLoading(true);
+    setOsmpError(null);
+    audioEngine.loadOsmp(osmpFilePath.trim());
+  };
+
+  const handleOsmpWarm = () => {
+    setOsmpWarming(true);
+    audioEngine.warmOsmpCache();
+    setTimeout(() => { setOsmpWarming(false); setOsmpWarmed(true); }, 2500);
+  };
+
+  const handleOsmpTrigger = (padId: number) => {
+    if (!osmpInfo) return;
+    audioEngine.noteOn(padMidiNotes[padId] ?? (padId + 36), osmpVelocity);
+  };
+
+  const handleCcChange = (cc: number, value: number) => {
+    setOsmpCcState(prev => ({ ...prev, [String(cc)]: value }));
+    audioEngine.setOsmpCC(cc, value);
+  };
+
+  // Load / Save project
+  const handleSaveProject = () => {
+    const data = {
+      pads: pads.map(p => ({ id: p.id, label: p.label, filePath: p.filePath, startPoint: p.startPoint, endPoint: p.endPoint })),
+      padMidiNotes,
+      osmpFilePath,
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'project.osmp'; a.click();
+    URL.revokeObjectURL(url);
+    setHasUnsavedChanges(false);
+  };
+
+  const handleLoadProjectFile = async (path: string) => {
+    try {
+      const res = await fetch(path).catch(() => null);
+      let text: string;
+      if (res?.ok) {
+        text = await res.text();
+      } else {
+        // Try reading via XMLHttpRequest (local file)
+        text = await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('GET', 'file:///' + path.replace(/\\/g, '/'));
+          xhr.onload = () => resolve(xhr.responseText);
+          xhr.onerror = () => reject(new Error('Cannot read file'));
+          xhr.send();
+        });
+      }
+      const data = JSON.parse(text);
+      if (Array.isArray(data.pads)) {
+        setPads(prev => prev.map(p => {
+          const saved = data.pads.find((s: any) => s.id === p.id);
+          if (!saved) return p;
+          if (saved.filePath) audioEngine.load(p.id, saved.filePath);
+          return { ...p, label: saved.label ?? p.label, filePath: saved.filePath, startPoint: saved.startPoint ?? 0, endPoint: saved.endPoint ?? 1 };
+        }));
+      }
+      if (Array.isArray(data.padMidiNotes)) setPadMidiNotes(data.padMidiNotes);
+      if (typeof data.osmpFilePath === 'string') setOsmpFilePath(data.osmpFilePath);
+      setHasUnsavedChanges(false);
+    } catch (err) {
+      console.error('Failed to load project:', err);
+    }
+  };
+
+  const handleLoadProject = () => setShowProjectBrowser(true);
 
   // Mock data for pads
   const [pads, setPads] = useState<PadData[]>(
@@ -590,6 +734,7 @@ const App: React.FC = () => {
     console.log('showExitDialog state:', showExitDialog);
   }, [showExitDialog]);
 
+
   return (
     <div className="bg-app-bg text-text-main font-mona h-screen flex flex-col overflow-hidden select-none text-sm">
       {/* Header */}
@@ -598,162 +743,76 @@ const App: React.FC = () => {
           <img src={Logo} alt="" />
         </div>
         <nav className="flex gap-5 text-xs font-semibold text-text-muted flex items-center">
-          <DropdownMenu
-            label="FILE"
-            items={[
-              {
-                label: 'Audio Settings...',
-                onClick: () => openAudioSettings(),
-                icon: <FileAudio size={14} />,
-              },
-              { divider: true } as any,
-              {
-                label: 'Exit',
-                onClick: () => setShowExitDialog(true),
-              },
-            ]}
-          />
-          <DropdownMenu
-            label="EDIT"
-            items={[
-              {
-                label: 'Preferences',
-                onClick: () => {},
-                icon: <Settings size={14} />,
-                disabled: true,
-              },
-            ]}
-          />
-          <DropdownMenu
-            label="MAPPING"
-            items={[
-              {
-                label: 'MIDI Notes\u2026',
-                onClick: () => openMidiSettings('midi'),
-                icon: <Music size={14} />,
-              },
-              {
-                label: 'Keyboard Keys\u2026',
-                onClick: () => openMidiSettings('key'),
-                icon: <Keyboard size={14} />,
-              },
-            ]}
-          />
-          <DropdownMenu
-            label="TOOL"
-            items={[
-              {
-                label: 'MIDI Keymap\u2026',
-                onClick: () => openMidiSettings('midi'),
-                icon: <Keyboard size={14} />,
-              },
-              { divider: true } as any,
-              {
-                label: 'Open Mixer',
-                onClick: () => {},
-                icon: <Layout size={14} />,
-                disabled: true,
-              },
-            ]}
-          />
-          <DropdownMenu
-            label="HELP"
-            items={[
-              {
-                label: 'About',
-                onClick: () => {},
-                icon: <HelpCircle size={14} />,
-                disabled: true,
-              },
-            ]}
-          />
+          <DropdownMenu label="FILE" items={[
+            { label: 'New Project', onClick: () => { setPads(Array.from({ length: 32 }, (_, i) => ({ id: i, label: '', isMuted: false, isSolo: false, isActive: i === 0, filePath: undefined, waveformPeaks: undefined, duration: 0, startPoint: 0, endPoint: 1 }))); setHasUnsavedChanges(false); } },
+            { label: 'Open Project…', onClick: handleLoadProject, icon: <FileAudio size={14} /> },
+            { label: 'Save Project', onClick: handleSaveProject },
+            { divider: true } as any,
+            { label: 'Audio Settings...', onClick: () => openAudioSettings() },
+            { divider: true } as any,
+            { label: 'Exit', onClick: () => setShowExitDialog(true) },
+          ]} />
+          <DropdownMenu label="EDIT" items={[
+            { label: 'Preferences', onClick: () => {}, icon: <Settings size={14} />, disabled: true },
+          ]} />
+          <DropdownMenu label="MAPPING" items={[
+            { label: 'MIDI Notes\u2026', onClick: () => openMidiSettings('midi'), icon: <Music size={14} /> },
+            { label: 'Keyboard Keys\u2026', onClick: () => openMidiSettings('key'), icon: <Keyboard size={14} /> },
+          ]} />
+          <DropdownMenu label="TOOL" items={[
+            { label: 'MIDI Keymap\u2026', onClick: () => openMidiSettings('midi'), icon: <Keyboard size={14} /> },
+            { divider: true } as any,
+            { label: 'Open Mixer', onClick: () => {}, icon: <Layout size={14} />, disabled: true },
+          ]} />
+          <DropdownMenu label="HELP" items={[
+            { label: 'About', onClick: () => {}, icon: <HelpCircle size={14} />, disabled: true },
+          ]} />
         </nav>
-
-        {/* Right-side header actions */}
         <div className="ml-auto flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => openMidiSettings('midi')}
-            className="flex items-center gap-1.5 h-6 px-2.5 text-[10px] font-bold uppercase tracking-widest rounded border border-[#1c1c1c] text-[#3a3a3a] hover:text-[#7df9ff] hover:border-[#7df9ff22] hover:bg-[#0a1415] transition-colors"
-          >
-            <Keyboard size={11} />
-            MIDI Map
+          <button type="button" onClick={() => openMidiSettings('midi')}
+            className="flex items-center gap-1.5 h-6 px-2.5 text-[10px] font-bold uppercase tracking-widest rounded border border-[#1c1c1c] text-[#3a3a3a] hover:text-[#7df9ff] hover:border-[#7df9ff22] hover:bg-[#0a1415] transition-colors">
+            <Keyboard size={11} /> MIDI Map
           </button>
         </div>
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-
         <Sidebar onFileSelect={handleSidebarFileSelect} />
-
-        {/* Main Content */}
         <main className="flex-1 flex flex-col bg-app-bg min-w-0">
-
           {/* Top Control Panel */}
           <div className="h-control-h border-border-dark flex shrink-0 border-b border-[#1e1e1e]">
-
-            {/* Waveform Section */}
             <div className="flex-1 flex flex-col border-r border-[#1e1e1e] min-w-0 relative group">
               <div className="absolute top-0 left-0 bg-accent-cyan text-black px-2.5 py-0.5 text-[10px] font-bold z-10 tracking-wider uppercase">
                 {selectedPad?.label || 'EMPTY_SLOT'}
               </div>
-              <WaveformDisplay
-                color="text-accent-cyan"
-                peaks={selectedPad?.waveformPeaks}
-                isPlaying={isPlaying && selectedPad?.filePath !== undefined}
-                playProgress={playProgress}
-                startPoint={selectedPad?.startPoint || 0}
-                endPoint={selectedPad?.endPoint || 1}
-                onStartPointChange={handleStartPointChange}
-                onEndPointChange={handleEndPointChange}
-              />
+              <WaveformDisplay color="text-accent-cyan" peaks={selectedPad?.waveformPeaks}
+                isPlaying={isPlaying && selectedPad?.filePath !== undefined} playProgress={playProgress}
+                startPoint={selectedPad?.startPoint || 0} endPoint={selectedPad?.endPoint || 1}
+                onStartPointChange={handleStartPointChange} onEndPointChange={handleEndPointChange} />
               <div className="flex justify-between text-[10px] text-text-main px-2.5 py-1 border-t border-[#1e1e1e] bg-[#0f0f0f]">
-                <span className="font-mono text-gray-600 text-[9px] uppercase tracking-wider">
-                  Start: 000000 ms
-                </span>
-                <span className="font-mono text-gray-500 text-[9px]">
-                  Duration: {selectedPad?.duration ? selectedPad.duration.toFixed(3) : '0.000'} s
-                </span>
+                <span className="font-mono text-gray-600 text-[9px] uppercase tracking-wider">Start: 000000 ms</span>
+                <span className="font-mono text-gray-500 text-[9px]">Duration: {selectedPad?.duration ? selectedPad.duration.toFixed(3) : '0.000'} s</span>
               </div>
             </div>
-
-            {/* Envelope Section */}
             <div className="w-80 bg-panel-bg border-r border-[#1e1e1e] flex flex-col shrink-0">
-              <div className="bg-[#161616] text-text-muted text-[10px] h-7 font-bold px-2.5 py-1 border-b border-[#1e1e1e] uppercase tracking-widest flex items-center">
-                Envelope Generator
-              </div>
+              <div className="bg-[#161616] text-text-muted text-[10px] h-7 font-bold px-2.5 py-1 border-b border-[#1e1e1e] uppercase tracking-widest flex items-center">Envelope Generator</div>
               <div className="flex items-center justify-around flex-1 px-2 pb-2">
                 <Knob label="Attack"  value={envelope.attack}  onChange={(v) => setEnvelope(e => ({ ...e, attack: v }))}  suffix="ms" />
                 <Knob label="Decay"   value={envelope.decay}   onChange={(v) => setEnvelope(e => ({ ...e, decay: v }))}   suffix="ms" />
                 <Knob label="Sustain" value={envelope.sustain} onChange={(v) => setEnvelope(e => ({ ...e, sustain: v }))} suffix="%" />
               </div>
             </div>
-
-            {/* Options Section */}
-            <div className="w-48 bg-panel-bg border-r border-[#1e1e1e] text-xs flex flex-col shrink-0">
-              <div className="bg-[#161616] text-text-muted text-[10px] h-7 font-bold px-2.5 py-1 border-b border-[#1e1e1e] uppercase tracking-widest flex items-center">
-                Sample Properties
+            <div className="w-48 bg-panel-bg border-r border-[#1e1e1e] text-xs flex flex-col shrink-0 overflow-y-auto">
+              <div className="bg-[#161616] text-text-muted text-[10px] h-7 font-bold px-2.5 py-1 border-b border-[#1e1e1e] uppercase tracking-widest flex items-center shrink-0">
+                {osmpZones ? 'Zone Info' : 'Sample Properties'}
               </div>
-              <div className="p-3 flex flex-col gap-2.5">
-                {[
-                  { label: 'Root Note', value: 'C3' },
-                  { label: 'Tune',      value: '+0 st' },
-                  { label: 'Pitch',     value: '0.00' },
-                  { label: 'Pan',       value: 'C' },
-                ].map(({ label, value }) => (
-                  <div key={label} className="flex justify-between items-center">
-                    <span className="text-[10px] text-gray-600 uppercase tracking-wider">{label}</span>
-                    <span className="text-[11px] text-accent-cyan font-mono bg-black/40 px-1.5 py-0.5 rounded text-right min-w-[36px]">{value}</span>
-                  </div>
-                ))}
-              </div>
+              <OsmpPadProps
+                zone={osmpZones?.pad_slots[selectedPadId] ?? null}
+                padLabel={pads[selectedPadId]?.label}
+              />
             </div>
-
-            {/* Master Volume Section */}
             <div className="w-52 bg-panel-bg flex flex-col shrink-0">
-              <div className="bg-[#161616] text-text-muted text-[10px] h-7 font-bold px-2.5 py-1 border-b border-[#1e1e1e] uppercase tracking-widest flex items-center">
-                Master
-              </div>
+              <div className="bg-[#161616] text-text-muted text-[10px] h-7 font-bold px-2.5 py-1 border-b border-[#1e1e1e] uppercase tracking-widest flex items-center">Master</div>
               <div className="flex items-center justify-around flex-1 px-3 pb-2">
                 <div className="flex flex-col items-center gap-1">
                   <VUMeter level={vuLevel} width={48} height={60} />
@@ -764,63 +823,56 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* Pads Grid */}
-          {viewMode === 'pad' ? (
-            <PadGrid
-              pads={pads}
-              onSelect={handlePadSelect}
-              onToggle={handlePadToggle}
-              onPlay={playPad}
-              onFileLoadToPad={handleFileLoadToPad as any}
-              onSwapPads={handleSwapPads}
-              onCopyPadTo={handleCopyPadTo}
-              onClearPad={handleClearPad}
-              onPathDrop={handlePathDrop}
-              viewMode={viewMode}
-              onToggleViewMode={() => setViewMode('drum')}
-              padKeys={padKeys}
-            />
-          ) : (
-            <div className="flex-1 flex flex-col min-h-0 bg-[#080808]">
-              <div className="h-7 flex items-center px-3 gap-3 shrink-0 border-t border-b border-[#171717]">
-                <button
-                  type="button"
-                  onClick={() => setViewMode('pad')}
-                  className="h-5 px-2 rounded text-[9px] font-bold uppercase tracking-widest border border-[#1f1f1f] bg-[#0a0a0a] text-[#4a4a4a] hover:text-[#7df9ff] hover:border-[#2a2a2a]"
-                >
-                  Pad View
-                </button>
-                <div className="flex-1" />
-                <span className="text-[9px] font-mono text-[#2e2e2e]">View more</span>
-              </div>
-              <DrumView pads={pads} onSelect={handlePadSelect} onPlay={playPad} />
-            </div>
-          )}
+          {(() => {
+            const osmpBar = (
+              <OsmpBar
+                filePath={osmpFilePath}
+                onFilePathChange={setOsmpFilePath}
+                onLoad={handleOsmpLoad}
+                loading={osmpLoading}
+                info={osmpInfo}
+                error={osmpError}
+                velocity={osmpVelocity}
+                onVelocityChange={setOsmpVelocity}
+                warmed={osmpWarmed}
+                warming={osmpWarming}
+                onWarm={handleOsmpWarm}
+                ccLabels={osmpZones?.cc_labels}
+                ccState={osmpCcState}
+                onCcChange={handleCcChange}
+              />
+            );
+            return viewMode === 'pad' ? (
+              <PadGrid pads={pads} onSelect={handlePadSelect} onToggle={handlePadToggle} onPlay={playPad}
+                onFileLoadToPad={handleFileLoadToPad as any} onSwapPads={handleSwapPads} onCopyPadTo={handleCopyPadTo}
+                onClearPad={handleClearPad} onPathDrop={handlePathDrop} viewMode={viewMode}
+                onToggleViewMode={() => setViewMode('drum')} padKeys={padKeys}
+                osmpBar={osmpBar} onOsmpTrigger={handleOsmpTrigger} />
+            ) : (
+              <DrumView pads={pads} onSelect={handlePadSelect} onPlay={playPad}
+                osmpBar={osmpBar} onOsmpTrigger={handleOsmpTrigger} />
+            );
+          })()}
 
-          {/* Bottom Effects Rack */}
           <EffectsRack />
-
         </main>
       </div>
 
-      <MidiSettings
-        isOpen={showMidiSettings}
-        onClose={() => setShowMidiSettings(false)}
-        pads={pads}
-        padMidiNotes={padMidiNotes}
-        padKeys={padKeys}
-        onChangeMidiNote={handleChangeMidiNote}
-        onChangeKey={handleChangeKey}
-        onResetMidi={handleResetMidi}
-        onResetKeys={handleResetKeys}
-        defaultTab={midiSettingsTab}
+      <FileBrowser
+        isOpen={showProjectBrowser}
+        onClose={() => setShowProjectBrowser(false)}
+        onSelect={handleLoadProjectFile}
+        filter={['osmp', 'json']}
+        title="Open Project"
       />
 
-      {/* Exit Confirmation Dialog */}
+      <MidiSettings isOpen={showMidiSettings} onClose={() => setShowMidiSettings(false)} pads={pads}
+        padMidiNotes={padMidiNotes} padKeys={padKeys} onChangeMidiNote={handleChangeMidiNote}
+        onChangeKey={handleChangeKey} onResetMidi={handleResetMidi} onResetKeys={handleResetKeys}
+        defaultTab={midiSettingsTab} />
+
       <Dialog isOpen={showExitDialog} onClose={handleCancelExit} title="Unsaved Changes" size="sm">
-        <p className="mb-4 text-text-muted leading-relaxed">
-          You have unsaved changes. Are you sure you want to exit?
-        </p>
+        <p className="mb-4 text-text-muted leading-relaxed">You have unsaved changes. Are you sure you want to exit?</p>
         <DialogFooter>
           <DialogButton onClick={handleCancelExit} variant="secondary">Cancel</DialogButton>
           <DialogButton onClick={handleConfirmExit} variant="danger">Exit Without Saving</DialogButton>
@@ -831,59 +883,35 @@ const App: React.FC = () => {
         <div className="space-y-4">
           <div>
             <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">Playback API</div>
-            <MenuSelect value={selectedBackend} placeholder="(No backends reported)"
-              items={audioBackends.map(b => ({ label: b, value: b }))} onChange={(v) => applyBackend(v)} />
+            <MenuSelect value={selectedBackend} placeholder="(No backends reported)" items={audioBackends.map(b => ({ label: b, value: b }))} onChange={(v) => applyBackend(v)} />
           </div>
           <div>
             <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">Output Device</div>
-            <MenuSelect value={selectedDevice} placeholder="(No devices reported)"
-              items={audioDevices.map(d => ({ label: d, value: d }))} onChange={(v) => applyDevice(v)} />
+            <MenuSelect value={selectedDevice} placeholder="(No devices reported)" items={audioDevices.map(d => ({ label: d, value: d }))} onChange={(v) => applyDevice(v)} />
           </div>
           <div>
             <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">Buffer size (frames)</div>
-            <MenuSelect value={String(bufferSizeFrames)} placeholder="Auto"
-              items={[
-                { label: 'Auto', value: '0' }, { label: '64', value: '64' }, { label: '128', value: '128' },
-                { label: '256', value: '256' }, { label: '512', value: '512' }, { label: '1024', value: '1024' },
-                { label: '2048', value: '2048' }, { label: '4096', value: '4096' }, { label: '8192', value: '8192' },
-              ]}
-              onChange={(v) => applyBufferFrames(Number(v))} />
-            <div className="mt-2 text-[11px] text-text-muted leading-relaxed">
-              Set to 0 for auto (uses latency). Setting an explicit frame size overrides latency.
-            </div>
+            <MenuSelect value={String(bufferSizeFrames)} placeholder="Auto" items={[{ label: 'Auto', value: '0' }, { label: '64', value: '64' }, { label: '128', value: '128' }, { label: '256', value: '256' }, { label: '512', value: '512' }, { label: '1024', value: '1024' }, { label: '2048', value: '2048' }, { label: '4096', value: '4096' }, { label: '8192', value: '8192' }]} onChange={(v) => applyBufferFrames(Number(v))} />
+            <div className="mt-2 text-[11px] text-text-muted leading-relaxed">Set to 0 for auto (uses latency). Setting an explicit frame size overrides latency.</div>
           </div>
           <div>
             <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">Sample Rate</div>
-            <MenuSelect value={String(sampleRate)} placeholder="Device default"
-              items={[
-                { label: 'Device default', value: '0' }, { label: '44100 Hz', value: '44100' },
-                { label: '48000 Hz', value: '48000' }, { label: '96000 Hz', value: '96000' },
-              ]}
-              onChange={(v) => applySampleRate(Number(v))} />
-            <div className="mt-2 text-[11px] text-text-muted leading-relaxed">
-              Custom rates require WASAPI Exclusive mode.
-            </div>
+            <MenuSelect value={String(sampleRate)} placeholder="Device default" items={[{ label: 'Device default', value: '0' }, { label: '44100 Hz', value: '44100' }, { label: '48000 Hz', value: '48000' }, { label: '96000 Hz', value: '96000' }]} onChange={(v) => applySampleRate(Number(v))} />
+            <div className="mt-2 text-[11px] text-text-muted leading-relaxed">Custom rates require WASAPI Exclusive mode.</div>
           </div>
           <div className="flex items-center justify-between">
             <div>
               <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted">WASAPI Exclusive Mode</div>
               <div className="mt-1 text-[11px] text-text-muted leading-relaxed">Direct hardware access for minimum latency.</div>
             </div>
-            <button
-              onClick={() => applyWasapiExclusive(!wasapiExclusive)}
-              className={`w-10 h-5 rounded-full transition-colors shrink-0 ml-4 ${wasapiExclusive ? 'bg-accent-cyan' : 'bg-[#2a2a2a]'}`}
-            >
+            <button onClick={() => applyWasapiExclusive(!wasapiExclusive)} className={`w-10 h-5 rounded-full transition-colors shrink-0 ml-4 ${wasapiExclusive ? 'bg-accent-cyan' : 'bg-[#2a2a2a]'}`}>
               <span className={`block w-4 h-4 rounded-full bg-white shadow mx-0.5 transition-transform ${wasapiExclusive ? 'translate-x-5' : 'translate-x-0'}`} />
             </button>
           </div>
           <div>
             <div className="text-[10px] font-bold uppercase tracking-wider text-text-muted mb-2">MIDI Input Device</div>
-            <MenuSelect value={selectedMidiInput} placeholder="(No MIDI inputs detected)"
-              items={[{ label: '— None —', value: '' }, ...midiInputPorts.map(p => ({ label: p, value: p }))]}
-              onChange={(v) => applyMidiInput(v)} />
-            <div className="mt-2 text-[11px] text-text-muted leading-relaxed">
-              MIDI notes 36–67 trigger pads 1–32 (GM drum map).
-            </div>
+            <MenuSelect value={selectedMidiInput} placeholder="(No MIDI inputs detected)" items={[{ label: '— None —', value: '' }, ...midiInputPorts.map(p => ({ label: p, value: p }))]} onChange={(v) => applyMidiInput(v)} />
+            <div className="mt-2 text-[11px] text-text-muted leading-relaxed">MIDI notes 36-67 trigger pads 1-32 (GM drum map).</div>
           </div>
         </div>
       </Dialog>

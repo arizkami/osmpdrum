@@ -95,8 +95,20 @@ export class AudioEngine {
         this.send('ConfirmExit', {});
     }
 
-    public listDirectory(path?: string) {
-        this.send('ListDirectory', { path: path ?? null });
+    public listDirectory(path?: string, filter?: string[]) {
+        this.send('ListDirectory', { path: path ?? null, filter: filter ?? null });
+    }
+
+    public getDrives() {
+        this.send('GetDrives', {});
+    }
+
+    public getOsmpZones() {
+        this.send('GetOsmpZones', {});
+    }
+
+    public setOsmpCC(cc_num: number, value: number) {
+        this.send('SetOsmpCC', { cc_num, value });
     }
 
     public getPresets() {
@@ -121,6 +133,22 @@ export class AudioEngine {
 
     public setSampleRate(rate: number) {
         this.send('SetSampleRate', { rate });
+    }
+
+    public loadOsmp(path: string) {
+        this.send('LoadOsmp', { path });
+    }
+
+    public noteOn(note: number, vel: number) {
+        this.send('NoteOn', { note, vel });
+    }
+
+    public warmOsmpCache() {
+        this.send('WarmOsmpCache', {});
+    }
+
+    public getOsmpInfo() {
+        this.send('GetOsmpInfo', {});
     }
 }
 

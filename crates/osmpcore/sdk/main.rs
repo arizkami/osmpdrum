@@ -1,4 +1,6 @@
+mod bench;
 mod convertaudio;
+mod session;
 mod loadjson;
 mod mkosmp;
 mod pack;
@@ -36,6 +38,9 @@ enum Cmd {
     /// Convert all audio referenced in a zone map JSON and pack into .osmp
     Packjson(packjson::PackjsonArgs),
 
+    /// Benchmark mmap access, zone queries, and f32 decode on an .osmp file
+    Bench(bench::BenchArgs),
+
     /// Print metadata of an .osmp container
     Info {
         /// Path to the .osmp file
@@ -52,6 +57,7 @@ fn main() {
         Cmd::Pack(a)       => pack::run(a),
         Cmd::Loadjson(a)   => loadjson::run(a),
         Cmd::Packjson(a)   => packjson::run(a),
+        Cmd::Bench(a)      => bench::run(a),
         Cmd::Info { file } => run_info(&file).map_err(|e| Box::new(e) as _),
     };
 

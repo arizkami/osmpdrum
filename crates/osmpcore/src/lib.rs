@@ -913,5 +913,105 @@ mod tests {
         assert!(matches!(err, Err(OsmpError::CapacityExceeded(_, _))));
         std::fs::remove_file(&tmp).ok();
     }
+
+    // ── Real drum instrument (mmap) ────────────────────────────────────────────
+    // Requires packtest/test.osmp — build it first with:
+    //   osmp packjson test\Programs\raw\full\01-full.json --pack-only \
+    //       --pack packtest/test.osmp --skip-missing
+    // Run: cargo test mmap_drum_instrument -- --ignored --nocapture
+
+    #[test]
+    #[ignore = "requires packtest/test.osmp"]
+    fn mmap_drum_instrument() {
+        let osmp_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap()  // crates/osmpcore → crates
+            .parent().unwrap()  // crates          → project root
+            .join("packtest/test.osmp");
+
+        if !osmp_path.exists() {
+            eprintln!("SKIP: {:?} not found", osmp_path);
+            return;
+        }
+
+        // ── Open via mmap ─────────────────────────────────────────────────────
+        let t0 = std::time::Instant::now();
+        let mm = OsmpMmapReader::open(&osmp_path).expect("open mmap");
+        let open_us = t0.elapsed().as_micros();
+
+        println!("container : {} v{}  ({} samples)  open={open_us}µs",
+            mm.header.name, mm.header.version, mm.samples.len());
+        println!("file size : {} MB", mm.file_size() / 1_048_576);
+        if mm.header.json_len > 0 {
+            println!("json blob : {} B", mm.header.json_len);
+        }
+
+        assert!(mm.header.version >= 1);
+        assert!(!mm.samples.is_empty(), "no samples in container");
+
+        // ── Embedded JSON → ZoneMap ───────────────────────────────────────────
+        if mm.header.json_len > 0 {
+            let json_str = mm.read_json().expect("read_json failed");
+            let doc: crate::sfzjson::SfzJson =
+                serde_json::from_str(&json_str).expect("invalid JSON in blob");
+            let map = crate::sfzjson::ZoneMap::new(&doc);
+            let cc  = doc.initial_cc();
+
+            println!("zones     : {}", doc.zones.len());
+
+            // Sample a spread of MIDI notes
+            let test_notes: &[u8] = &[36, 38, 40, 42, 44, 46, 49, 51, 56, 60];
+            println!("\nzone query results:");
+            for &note in test_notes {
+                let srcs = map.audio_sources(note, 100, &cc);
+                if !srcs.is_empty() {
+                    println!("  note {:>3}  {:>2} zone(s)  pitch={:.4}  amp={:.4}  {}",
+                        note, srcs.len(),
+                        srcs[0].pitch_ratio, srcs[0].amplitude,
+                        srcs[0].sample);
+                }
+            }
+        }
+
+        // ── Random mmap sample access ─────────────────────────────────────────
+        let n        = mm.samples.len();
+        let n_reads  = 200.min(n);
+        // LCG pseudo-random for reproducibility
+        let mut rng  = 0xDEAD_BEEF_u64;
+        let indices: Vec<usize> = (0..n_reads).map(|_| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (rng >> 33) as usize % n
+        }).collect();
+
+        let t1 = std::time::Instant::now();
+        let mut total_bytes  = 0usize;
+        let mut total_frames = 0u64;
+        for &idx in &indices {
+            let bytes = mm.sample_bytes(idx).expect("sample_bytes");
+            assert!(!bytes.is_empty(), "sample {idx} has no PCM data");
+            total_bytes  += bytes.len();
+            total_frames += mm.samples[idx].num_frames as u64;
+        }
+        let elapsed = t1.elapsed();
+
+        println!("\nrandom mmap reads ({n_reads} samples):");
+        println!("  data        : {} MB  ({total_frames} frames)", total_bytes / 1_048_576);
+        println!("  wall time   : {:?}", elapsed);
+        println!("  throughput  : {:.1} MB/s",
+            total_bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0);
+        println!("  avg/sample  : {:?}", elapsed / n_reads as u32);
+
+        // ── Decode a random sample to f32 and validate range ──────────────────
+        let pick = indices[0];
+        let f32_data = mm.sample_f32(pick).expect("sample_f32");
+        assert!(!f32_data.is_empty());
+        for &s in &f32_data {
+            assert!(s >= -1.0 && s <= 1.0,
+                "sample[{pick}] out of range: {s}");
+        }
+        println!("\nsample[{pick}] ({}) decoded: {} frames  peak={:.4}",
+            mm.samples[pick].name,
+            f32_data.len() / mm.samples[pick].channels as usize,
+            f32_data.iter().cloned().fold(0.0_f32, f32::max));
+    }
 }
 

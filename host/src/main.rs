@@ -1,3 +1,5 @@
+mod player;
+
 use anyhow::Result;
 use axum::{
     extract::{State, WebSocketUpgrade},
@@ -28,6 +30,16 @@ enum AudioCommand {
     Play { pad_id: usize, file_path: String, volume: f32, pan: f32 },
     Stop { pad_id: usize },
     Load { pad_id: usize, file_path: String },
+    /// Load a v2 .osmp instrument file (replaces current player)
+    LoadOsmp { path: String },
+    /// Trigger note from frontend (bypasses WAV pad, hits OsmpPlayer)
+    NoteOn { note: u8, vel: u8 },
+    /// Pre-warm the OSMP decode cache
+    WarmOsmpCache {},
+    /// Return OsmpPlayer info as rust-osmp-info event
+    GetOsmpInfo {},
+    SetOsmpCC { cc_num: u8, value: u8 },
+    GetOsmpZones {},
     SetMasterVolume { volume: f32 },
     SetPlaybackLatency { latency_ms: u32 },
     GetAudioSettings {},
@@ -38,7 +50,8 @@ enum AudioCommand {
     SetBufferSizeFrames { frames: u32 },
     CheckUnsavedChanges,
     ConfirmExit,
-    ListDirectory { path: Option<String> },
+    ListDirectory { path: Option<String>, filter: Option<Vec<String>> },
+    GetDrives {},
     GetPresets {},
     GetLibrary {},
     GetMidiInputs {},
@@ -216,7 +229,7 @@ struct WaveformData {
 }
 
 struct AudioBuffer {
-    samples: Vec<f32>,
+    samples: Arc<Vec<f32>>,
     position: usize,
     volume: f32,
     playing: bool,
@@ -225,7 +238,7 @@ struct AudioBuffer {
 }
 
 impl AudioBuffer {
-    fn new(samples: Vec<f32>, volume: f32, pad_id: usize, voice_id: usize) -> Self {
+    fn new(samples: Arc<Vec<f32>>, volume: f32, pad_id: usize, voice_id: usize) -> Self {
         Self {
             samples,
             position: 0,
@@ -466,7 +479,7 @@ impl AudioEngine {
             id
         };
         
-        let buffer = AudioBuffer::new(samples, volume, pad_id, voice_id);
+        let buffer = AudioBuffer::new(Arc::new(samples), volume, pad_id, voice_id);
         
         let mut buffers = self.buffers.lock().unwrap();
         buffers.push(buffer);
@@ -863,9 +876,10 @@ async fn serve_frontend() -> Html<&'static str> {
 
 #[derive(Clone)]
 struct AppState {
-    engine:   Arc<Mutex<AudioEngine>>,
-    event_tx: broadcast::Sender<String>,
-    midi_conn: Arc<Mutex<Option<MidiInputConnection<()>>>>,
+    engine:      Arc<Mutex<AudioEngine>>,
+    event_tx:    broadcast::Sender<String>,
+    midi_conn:   Arc<Mutex<Option<MidiInputConnection<()>>>>,
+    osmp_player: Arc<Mutex<Option<player::OsmpPlayer>>>,
 }
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
@@ -986,7 +1000,7 @@ async fn handle_command(text: &str, state: &AppState) {
         }
         AudioCommand::CheckUnsavedChanges => { /* handled in frontend */ }
         AudioCommand::ConfirmExit => { std::process::exit(0); }
-        AudioCommand::ListDirectory { path } => {
+        AudioCommand::ListDirectory { path, filter } => {
             let tx2 = tx.clone();
             tokio::task::spawn_blocking(move || {
                 let dir = path.unwrap_or_else(|| {
@@ -994,16 +1008,22 @@ async fn handle_command(text: &str, state: &AppState) {
                         .or_else(|_| std::env::var("USERPROFILE"))
                         .unwrap_or_else(|_| ".".to_string())
                 });
+                let allowed: Option<Vec<String>> = filter;
                 let mut entries: Vec<FsEntry> = Vec::new();
                 if let Ok(rd) = std::fs::read_dir(&dir) {
                     for e in rd.filter_map(|e| e.ok()) {
-                        let meta  = e.metadata().ok();
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.starts_with('.') { continue; }
+                        let meta   = e.metadata().ok();
                         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                        let size  = if !is_dir { meta.map(|m| m.len()) } else { None };
-                        let name  = e.file_name().to_string_lossy().to_string();
-                        let path  = e.path().to_string_lossy().to_string();
-                        let ext   = e.path().extension().map(|x| x.to_string_lossy().to_lowercase().to_string()).unwrap_or_default();
-                        if is_dir || matches!(ext.as_str(), "wav" | "mp3" | "flac" | "ogg" | "aiff") {
+                        let size   = if !is_dir { meta.map(|m| m.len()) } else { None };
+                        let path   = e.path().to_string_lossy().to_string();
+                        let ext    = e.path().extension().map(|x| x.to_string_lossy().to_lowercase().to_string()).unwrap_or_default();
+                        let show = is_dir || match &allowed {
+                            Some(exts) => exts.iter().any(|x| x == &ext),
+                            None => matches!(ext.as_str(), "wav" | "mp3" | "flac" | "ogg" | "aiff" | "osmp" | "osmpd" | "json"),
+                        };
+                        if show {
                             entries.push(FsEntry { name, path, is_dir, size });
                         }
                     }
@@ -1013,11 +1033,29 @@ async fn handle_command(text: &str, state: &AppState) {
                     (false, true) => std::cmp::Ordering::Greater,
                     _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 });
+                // Add parent entry when not at root
+                let p = std::path::Path::new(&dir);
+                let parent = p.parent().map(|x| x.to_string_lossy().to_string());
                 #[derive(Serialize)]
-                struct DirPayload { path: String, entries: Vec<FsEntry> }
-                let payload = DirPayload { path: dir, entries };
+                struct DirPayload { path: String, parent: Option<String>, entries: Vec<FsEntry> }
+                let payload = DirPayload { path: dir, parent, entries };
                 if let Ok(json) = serde_json::to_string(&payload) {
                     let _ = tx2.send(format!(r#"{{"type":"rust-dir-listing","detail":{}}}"#, json));
+                }
+            });
+        }
+        AudioCommand::GetDrives {} => {
+            let tx2 = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                #[cfg(target_os = "windows")]
+                let drives: Vec<String> = (b'A'..=b'Z')
+                    .map(|c| format!("{}:\\", c as char))
+                    .filter(|d| std::path::Path::new(d).exists())
+                    .collect();
+                #[cfg(not(target_os = "windows"))]
+                let drives: Vec<String> = vec!["/".to_string()];
+                if let Ok(json) = serde_json::to_string(&drives) {
+                    let _ = tx2.send(format!(r#"{{"type":"rust-drives","detail":{}}}"#, json));
                 }
             });
         }
@@ -1066,8 +1104,12 @@ async fn handle_command(text: &str, state: &AppState) {
             let mut conn_guard = state.midi_conn.lock().unwrap();
             *conn_guard = None;
             if let Some(ref name) = port_name {
-                let tx2 = tx.clone();
-                if let Some(conn) = connect_midi_input(name, tx2) {
+                let tx2          = tx.clone();
+                let (bufs, vids) = {
+                    let eng = state.engine.lock().unwrap_or_else(|p| p.into_inner());
+                    (eng.buffers.clone(), eng.next_voice_id.clone())
+                };
+                if let Some(conn) = connect_midi_input(name, tx2, bufs, vids, state.osmp_player.clone()) {
                     *conn_guard = Some(conn);
                     println!("MIDI connected: {}", name);
                     if let Ok(eng) = state.engine.lock() {
@@ -1100,10 +1142,200 @@ async fn handle_command(text: &str, state: &AppState) {
         AudioCommand::SetSampleRate { rate } => {
             if let Ok(mut eng) = state.engine.lock() { eng.set_sample_rate(rate); }
         }
+
+        // ── OSMP Player commands ──────────────────────────────────────────────
+        AudioCommand::LoadOsmp { path } => {
+            let tx2     = tx.clone();
+            let player2 = state.osmp_player.clone();
+            tokio::task::spawn_blocking(move || {
+                #[derive(Serialize)]
+                struct OsmpLoadedInfo { name: String, samples: usize, zones: usize, size_mb: usize, json_len: u32 }
+                match player::OsmpPlayer::load(&path) {
+                    Ok(p) => {
+                        let info = OsmpLoadedInfo {
+                            name:     p.name().to_owned(),
+                            samples:  p.sample_count(),
+                            zones:    p.zone_count(),
+                            size_mb:  p.file_size_mb(),
+                            json_len: p.json_len(),
+                        };
+                        let zones_json = build_osmp_zones_json(&p);
+                        *player2.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+                        if let Ok(detail) = serde_json::to_string(&info) {
+                            let _ = tx2.send(format!(r#"{{"type":"rust-osmp-loaded","detail":{detail}}}"#));
+                        }
+                        let _ = tx2.send(format!(r#"{{"type":"rust-osmp-zones","detail":{zones_json}}}"#));
+                    }
+                    Err(e) => {
+                        eprintln!("LoadOsmp error: {}", e);
+                        let msg = format!(
+                            r#"{{"type":"rust-osmp-error","detail":{{"error":"{}"}}}}"#,
+                            e.to_string().replace('"', "'")
+                        );
+                        let _ = tx2.send(msg);
+                    }
+                }
+            });
+        }
+
+        AudioCommand::NoteOn { note, vel } => {
+            let engine2 = state.engine.clone();
+            let player2 = state.osmp_player.clone();
+            let sources = {
+                let guard = player2.lock().unwrap_or_else(|p| p.into_inner());
+                guard.as_ref().map(|p| p.trigger(note, vel, None))
+            };
+            if let Some(sources) = sources {
+                if let Ok(mut eng) = engine2.lock() {
+                    eng.start_stream().ok();
+                    let mut voice = eng.next_voice_id.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut bufs  = eng.buffers.lock().unwrap_or_else(|p| p.into_inner());
+                    for (amp, _pan, pcm) in sources {
+                        let vid  = *voice;
+                        *voice   = voice.wrapping_add(1);
+                        let mono = Arc::new(player::stereo_to_mono(&pcm));
+                        bufs.push(AudioBuffer::new(mono, amp.clamp(0.0, 1.0), note as usize, vid));
+                    }
+                }
+            }
+        }
+
+        AudioCommand::WarmOsmpCache {} => {
+            let player2 = state.osmp_player.clone();
+            tokio::task::spawn_blocking(move || {
+                let guard = player2.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(p) = guard.as_ref() { p.warm_cache(); }
+            });
+        }
+
+        AudioCommand::GetOsmpInfo {} => {
+            let guard = state.osmp_player.lock().unwrap_or_else(|p| p.into_inner());
+            let info = if let Some(p) = guard.as_ref() {
+                format!(
+                    r#"{{"loaded":true,"name":"{}","samples":{},"zones":{},"size_mb":{}}}"#,
+                    p.name(), p.sample_count(), p.zone_count(), p.file_size_mb()
+                )
+            } else {
+                r#"{"loaded":false}"#.to_string()
+            };
+            let _ = tx.send(format!(r#"{{"type":"rust-osmp-info","detail":{}}}"#, info));
+        }
+
+        AudioCommand::SetOsmpCC { cc_num, value } => {
+            let guard = state.osmp_player.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(p) = guard.as_ref() {
+                p.set_cc(cc_num, value);
+            }
+        }
+
+        AudioCommand::GetOsmpZones {} => {
+            let guard = state.osmp_player.lock().unwrap_or_else(|p| p.into_inner());
+            let json = if let Some(p) = guard.as_ref() {
+                build_osmp_zones_json(p)
+            } else {
+                "null".to_string()
+            };
+            let _ = tx.send(format!(r#"{{"type":"rust-osmp-zones","detail":{}}}"#, json));
+        }
     }
 }
 
-// ── MIDI helpers ──────────────────────────────────────────────────────────────
+// ── OSMP zone helpers ─────────────────────────────────────────────────────────
+
+fn derive_label(sample: &str) -> String {
+    let stem = std::path::Path::new(sample)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(sample);
+    let base = stem.split('_').next().unwrap_or(stem);
+    let mut chars = base.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
+fn build_osmp_zones_json(player: &player::OsmpPlayer) -> String {
+    use std::collections::BTreeMap;
+
+    #[derive(Serialize)]
+    struct ZoneSlot {
+        note:       u8,
+        label:      String,
+        sample:     String,
+        lo_key:     u8,
+        hi_key:     u8,
+        root_key:   u8,
+        lo_vel:     u8,
+        hi_vel:     u8,
+        group_id:   u32,
+        zone_count: usize,
+        seq_length: u8,
+        ampeg_attack:  f64,
+        ampeg_hold:    f64,
+        ampeg_decay:   f64,
+        ampeg_sustain: f64,
+        ampeg_release: f64,
+        volume_db:  f64,
+        pan:        f64,
+    }
+
+    #[derive(Serialize)]
+    struct OsmpZonesPayload {
+        name:      String,
+        cc_labels: std::collections::HashMap<String, String>,
+        cc_init:   std::collections::HashMap<String, u8>,
+        cc_state:  Vec<(u8, u8)>,
+        pad_slots: Vec<ZoneSlot>,
+    }
+
+    // Group zones by root_key using a BTreeMap so they come out sorted
+    let mut by_root: BTreeMap<u8, Vec<&osmpcore::sfzjson::Zone>> = BTreeMap::new();
+    for zone in &player.doc.zones {
+        by_root.entry(zone.root_key).or_default().push(zone);
+    }
+
+    let pad_slots: Vec<ZoneSlot> = by_root.iter().take(32).map(|(&root, zones)| {
+        let rep = zones[0];
+        ZoneSlot {
+            note:       root,
+            label:      derive_label(&rep.sample),
+            sample:     rep.sample.clone(),
+            lo_key:     rep.lo_key,
+            hi_key:     rep.hi_key,
+            root_key:   root,
+            lo_vel:     zones.iter().map(|z| z.lo_vel).min().unwrap_or(0),
+            hi_vel:     zones.iter().map(|z| z.hi_vel).max().unwrap_or(127),
+            group_id:   rep.group_id,
+            zone_count: zones.len(),
+            seq_length: rep.seq_length,
+            ampeg_attack:  rep.ampeg.attack,
+            ampeg_hold:    rep.ampeg.hold,
+            ampeg_decay:   rep.ampeg.decay,
+            ampeg_sustain: rep.ampeg.sustain,
+            ampeg_release: rep.ampeg.release,
+            volume_db:  rep.volume_db,
+            pan:        rep.pan,
+        }
+    }).collect();
+
+    let cc_state: Vec<(u8, u8)> = player.doc.cc_labels.keys()
+        .filter_map(|k| k.parse::<u8>().ok())
+        .map(|n| (n, player.get_cc()[n as usize]))
+        .collect();
+
+    let payload = OsmpZonesPayload {
+        name:      player.doc.name.clone(),
+        cc_labels: player.doc.cc_labels.clone(),
+        cc_init:   player.doc.cc_init.clone(),
+        cc_state,
+        pad_slots,
+    };
+
+    serde_json::to_string(&payload).unwrap_or_else(|_| "null".to_string())
+}
+
+// ── MIDI helpers ─────────────────────────────────────────────────────────────
 
 fn list_midi_inputs() -> Vec<String> {
     match MidiInput::new("osmpdrum-list") {
@@ -1115,28 +1347,49 @@ fn list_midi_inputs() -> Vec<String> {
 }
 
 fn connect_midi_input(
-    port_name: &str,
-    tx: broadcast::Sender<String>,
+    port_name:    &str,
+    tx:           broadcast::Sender<String>,
+    engine_bufs:  Arc<Mutex<Vec<AudioBuffer>>>,
+    voice_id_ctr: Arc<Mutex<usize>>,
+    osmp_player:  Arc<Mutex<Option<player::OsmpPlayer>>>,
 ) -> Option<MidiInputConnection<()>> {
     let midi_in = MidiInput::new("osmpdrum").ok()?;
     let ports   = midi_in.ports();
     let port    = ports.iter().find(|p| midi_in.port_name(p).ok().as_deref() == Some(port_name))?;
     midi_in.connect(port, "osmpdrum-in", move |_ts, data, _| {
-        if data.len() >= 3 {
-            let kind    = data[0] & 0xF0;
-            let channel = data[0] & 0x0F;
-            if kind == 0x90 && data[2] > 0 {
-                let msg = format!(
-                    r#"{{"type":"rust-midi-note","detail":{{"note":{},"velocity":{},"channel":{}}}}}"#,
-                    data[1], data[2], channel
-                );
-                let _ = tx.send(msg);
+        if data.len() < 3 { return; }
+        let kind    = data[0] & 0xF0;
+        let channel = data[0] & 0x0F;
+        let note    = data[1];
+        let vel     = data[2];
+
+        if kind == 0x90 && vel > 0 {
+            // Notify UI
+            let msg = format!(
+                r#"{{"type":"rust-midi-note","detail":{{"note":{},"velocity":{},"channel":{}}}}}"#,
+                note, vel, channel
+            );
+            let _ = tx.send(msg);
+
+            // Trigger OsmpPlayer directly (no WS round-trip)
+            let sources = {
+                let guard = osmp_player.lock().unwrap_or_else(|p| p.into_inner());
+                guard.as_ref().map(|p| p.trigger(note, vel, None))
+            };
+            if let Some(sources) = sources {
+                let mut voice = voice_id_ctr.lock().unwrap_or_else(|p| p.into_inner());
+                let mut bufs  = engine_bufs.lock().unwrap_or_else(|p| p.into_inner());
+                for (amp, _pan, pcm) in sources {
+                    let vid = *voice;
+                    *voice  = voice.wrapping_add(1);
+                    // Average stereo → mono
+                    let mono: Arc<Vec<f32>> = Arc::new(player::stereo_to_mono(&pcm));
+                    bufs.push(AudioBuffer::new(mono, amp.clamp(0.0, 1.0), note as usize, vid));
+                }
             }
         }
     }, ()).ok()
 }
-
-// ── Filesystem helpers ────────────────────────────────────────────────────────
 
 fn scan_audio_dir(dir: &std::path::Path, entries: &mut Vec<LibraryEntry>) {
     if let Ok(read_dir) = std::fs::read_dir(dir) {
@@ -1171,19 +1424,25 @@ async fn main() -> Result<()> {
     let (event_tx, _) = broadcast::channel::<String>(256);
     let midi_conn: Arc<Mutex<Option<MidiInputConnection<()>>>> = Arc::new(Mutex::new(None));
 
+    let osmp_player: Arc<Mutex<Option<player::OsmpPlayer>>> = Arc::new(Mutex::new(None));
+
     // Reconnect saved MIDI port on startup
     {
         let saved = engine.lock().unwrap().get_settings_snapshot().midi_input_port.clone();
         if let Some(ref port) = saved {
-            let tx = event_tx.clone();
-            if let Some(conn) = connect_midi_input(port, tx) {
+            let tx   = event_tx.clone();
+            let (bufs, vids) = {
+                let eng = engine.lock().unwrap();
+                (eng.buffers.clone(), eng.next_voice_id.clone())
+            };
+            if let Some(conn) = connect_midi_input(port, tx, bufs, vids, osmp_player.clone()) {
                 *midi_conn.lock().unwrap() = Some(conn);
                 println!("MIDI auto-connected: {}", port);
             }
         }
     }
 
-    let state = AppState { engine, event_tx: event_tx.clone(), midi_conn };
+    let state = AppState { engine, event_tx: event_tx.clone(), midi_conn, osmp_player };
 
     println!("Serving embedded frontend ({} bytes)", FRONTEND_HTML.len());
 

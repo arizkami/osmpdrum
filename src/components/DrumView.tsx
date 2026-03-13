@@ -5,6 +5,8 @@ interface DrumViewProps {
   pads: PadData[];
   onSelect: (id: number) => void;
   onPlay?: (id: number) => void;
+  osmpBar?: React.ReactNode;
+  onOsmpTrigger?: (padId: number) => void;
 }
 
 type PieceKind = 'kick' | 'snare' | 'tom' | 'floor' | 'cymbal' | 'hihat';
@@ -59,20 +61,23 @@ function arcPath(cx: number, cy: number, rx: number, ry: number, scale: number, 
   return `M ${x1.toFixed(1)} ${y1.toFixed(1)} A ${(rx * scale).toFixed(1)} ${(ry * scale).toFixed(1)} 0 0 1 ${x2.toFixed(1)} ${y2.toFixed(1)}`;
 }
 
-export const DrumView: React.FC<DrumViewProps> = ({ pads, onSelect, onPlay }) => {
+export const DrumView: React.FC<DrumViewProps> = ({ pads, onSelect, onPlay, osmpBar, onOsmpTrigger }) => {
   const [hitKey, setHitKey] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleHit = useCallback((padId: number, key: string) => {
     onSelect(padId);
     onPlay?.(padId);
+    onOsmpTrigger?.(padId);
     if (timerRef.current) clearTimeout(timerRef.current);
     setHitKey(key);
     timerRef.current = setTimeout(() => setHitKey(null), 440);
-  }, [onSelect, onPlay]);
+  }, [onSelect, onPlay, onOsmpTrigger]);
 
   return (
-    <div className="flex-1 min-h-0 bg-[#060909]">
+    <div className="flex-1 flex flex-col min-h-0 bg-[#060909]">
+      {osmpBar}
+      <div className="flex-1 min-h-0">
       <svg
         className="w-full h-full"
         viewBox="0 0 1000 580"
@@ -256,6 +261,7 @@ export const DrumView: React.FC<DrumViewProps> = ({ pads, onSelect, onPlay }) =>
           );
         })}
       </svg>
+      </div>
     </div>
   );
 };

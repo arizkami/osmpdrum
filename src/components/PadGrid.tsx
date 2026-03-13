@@ -16,6 +16,8 @@ interface PadGridProps {
     viewMode?: 'pad' | 'drum';
     onToggleViewMode?: () => void;
     padKeys?: (string | null)[];
+    osmpBar?: React.ReactNode;
+    onOsmpTrigger?: (padId: number) => void;
 }
 
 const KEY_HINTS = [
@@ -37,6 +39,8 @@ export const PadGrid: React.FC<PadGridProps> = ({
     viewMode = 'pad',
     onToggleViewMode,
     padKeys,
+    osmpBar,
+    onOsmpTrigger,
 }) => {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; padId: number } | null>(null);
     const [dragOverPadId, setDragOverPadId] = useState<number | null>(null);
@@ -46,6 +50,7 @@ export const PadGrid: React.FC<PadGridProps> = ({
     const handlePadClick = (id: number) => {
         onSelect(id);
         if (onPlay) onPlay(id);
+        onOsmpTrigger?.(id);
     };
 
     const handlePadDragStart = (e: React.DragEvent, padId: number) => {
@@ -166,6 +171,8 @@ export const PadGrid: React.FC<PadGridProps> = ({
     return (
         <>
             <div className="flex-1 flex flex-col min-h-0 bg-[#080808]">
+
+                {osmpBar}
 
                 {/* Kit header */}
                 <div className="h-7 flex items-center px-3 gap-3 shrink-0 border-t border-b border-[#171717]">
