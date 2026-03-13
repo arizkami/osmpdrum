@@ -8,6 +8,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// Maximum decoded-PCM entries kept in the cache at one time.
+/// Entries that are only referenced by the cache (refcount == 1) are
+/// evicted first; if the map is still over this limit the whole cache
+/// is flushed so we never accumulate unbounded heap usage.
+const MAX_CACHE_ENTRIES: usize = 512;
+
+/// Maximum number of samples decoded upfront during a WarmCache request.
+/// Large kits can have thousands of samples – decoding all of them at once
+/// would exhaust RAM.
+const MAX_WARM_ENTRIES: usize = 128;
+
 /// A loaded `.osmp` drum instrument.
 ///
 /// Holds the memory-mapped file, embedded JSON zone map, and a lazy
@@ -88,7 +99,17 @@ impl OsmpPlayer {
         let sources = map.audio_sources(note, vel, cc_ref);
 
         let mut cache = self.decode_cache.lock().unwrap_or_else(|p| p.into_inner());
-        let mut out   = Vec::with_capacity(sources.len());
+
+        // Evict stale entries (only referenced by this cache) when over limit
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            cache.retain(|_, v| Arc::strong_count(v) > 1);
+            if cache.len() >= MAX_CACHE_ENTRIES {
+                cache.clear();
+                println!("[OsmpPlayer] decode_cache flushed (over {} entries)", MAX_CACHE_ENTRIES);
+            }
+        }
+
+        let mut out = Vec::with_capacity(sources.len());
 
         for src in &sources {
             let key = truncate_name(&src.sample);
@@ -103,15 +124,27 @@ impl OsmpPlayer {
         out
     }
 
-    /// Decode and cache every sample upfront (call once, off the audio thread).
+    /// Decode and cache the most-used samples upfront (capped to avoid OOM).
     pub fn warm_cache(&self) {
+        let total = self.mmap.samples.len();
+        let limit = total.min(MAX_WARM_ENTRIES);
         let mut cache = self.decode_cache.lock().unwrap_or_else(|p| p.into_inner());
-        for i in 0..self.mmap.samples.len() {
+        for i in 0..limit {
             cache.entry(i).or_insert_with(|| {
                 Arc::new(self.mmap.sample_f32(i).unwrap_or_default())
             });
         }
-        println!("[OsmpPlayer] cache warm: {} samples", self.mmap.samples.len());
+        println!("[OsmpPlayer] cache warm: {}/{} samples", limit, total);
+    }
+
+    /// Release all cached decoded PCM data that is not actively playing.
+    /// Entries with Arc refcount > 1 are still held by audio buffers and are kept.
+    pub fn clear_cache(&self) {
+        if let Ok(mut cache) = self.decode_cache.lock() {
+            let before = cache.len();
+            cache.retain(|_, v| Arc::strong_count(v) > 1);
+            println!("[OsmpPlayer] clear_cache: {} → {} entries", before, cache.len());
+        }
     }
 
     pub fn name(&self)         -> &str  { &self.mmap.header.name }

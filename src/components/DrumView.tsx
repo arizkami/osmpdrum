@@ -1,5 +1,9 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { PadData } from '../types';
+import type { OsmpZonesData } from '../types/osmp';
+
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const noteName = (n: number) => `${NOTE_NAMES[n % 12]}${Math.floor(n / 12) - 1}`;
 
 interface DrumViewProps {
   pads: PadData[];
@@ -7,6 +11,9 @@ interface DrumViewProps {
   onPlay?: (id: number) => void;
   osmpBar?: React.ReactNode;
   onOsmpTrigger?: (padId: number) => void;
+  osmpZones?: OsmpZonesData | null;
+  padMidiNotes?: number[];
+  activePadId?: number | null;
 }
 
 type PieceKind = 'kick' | 'snare' | 'tom' | 'floor' | 'cymbal' | 'hihat';
@@ -61,9 +68,22 @@ function arcPath(cx: number, cy: number, rx: number, ry: number, scale: number, 
   return `M ${x1.toFixed(1)} ${y1.toFixed(1)} A ${(rx * scale).toFixed(1)} ${(ry * scale).toFixed(1)} 0 0 1 ${x2.toFixed(1)} ${y2.toFixed(1)}`;
 }
 
-export const DrumView: React.FC<DrumViewProps> = ({ pads, onSelect, onPlay, osmpBar, onOsmpTrigger }) => {
+export const DrumView: React.FC<DrumViewProps> = ({
+  pads, onSelect, onPlay, osmpBar, onOsmpTrigger,
+  osmpZones, padMidiNotes, activePadId,
+}) => {
   const [hitKey, setHitKey] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Mirror activePadId flashes onto the drum SVG animation
+  useEffect(() => {
+    if (activePadId == null) return;
+    const piece = PIECES.find(p => p.padId === activePadId);
+    if (!piece) return;
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setHitKey(piece.key);
+    timerRef.current = setTimeout(() => setHitKey(null), 440);
+  }, [activePadId]);
 
   const handleHit = useCallback((padId: number, key: string) => {
     onSelect(padId);
@@ -248,15 +268,39 @@ export const DrumView: React.FC<DrumViewProps> = ({ pads, onSelect, onPlay, osmp
               )}
 
               {/* Label */}
-              <text
-                x={p.cx} y={p.cy + 5}
-                textAnchor="middle"
-                fontFamily="ui-monospace, Consolas, 'Courier New', monospace"
-                fontSize={p.kind === 'kick' ? 14 : 11}
-                fill={CYAN}
-                opacity={loaded ? 0.72 : 0.28}>
-                {pad?.label || p.name.toUpperCase()}
-              </text>
+              {(() => {
+                const midiNote = padMidiNotes?.[p.padId] ?? (p.padId + 36);
+                const zone = osmpZones?.pad_slots.find(s => s.note === midiNote) ?? null;
+                const displayLabel = zone?.label || pad?.label || p.name.toUpperCase();
+                const noteLabel = noteName(midiNote);
+                const hasZone = !!zone;
+                const labelSize = p.kind === 'kick' ? 14 : 11;
+                const noteY = p.cy + labelSize * 1.6;
+                return (
+                  <>
+                    <text
+                      x={p.cx} y={p.cy + 5}
+                      textAnchor="middle"
+                      fontFamily="ui-monospace, Consolas, 'Courier New', monospace"
+                      fontSize={labelSize}
+                      fill={CYAN}
+                      opacity={loaded ? 0.72 : 0.28}>
+                      {displayLabel}
+                    </text>
+                    {hasZone && (
+                      <text
+                        x={p.cx} y={noteY}
+                        textAnchor="middle"
+                        fontFamily="ui-monospace, Consolas, 'Courier New', monospace"
+                        fontSize={8}
+                        fill={CYAN}
+                        opacity={loaded ? 0.30 : 0.14}>
+                        {noteLabel}{zone.zone_count > 1 ? ` ·${zone.zone_count}L` : ''}
+                      </text>
+                    )}
+                  </>
+                );
+              })()}
             </g>
           );
         })}

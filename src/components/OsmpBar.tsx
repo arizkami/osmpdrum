@@ -21,6 +21,7 @@ export interface OsmpBarProps {
   warmed: boolean;
   warming: boolean;
   onWarm: () => void;
+  onLoadPath?: (path: string) => void;
   ccLabels?: Record<string, string>;
   ccState?: Record<string, number>;
   onCcChange?: (cc: number, value: number) => void;
@@ -30,7 +31,7 @@ export const OsmpBar: React.FC<OsmpBarProps> = ({
   filePath, onFilePathChange, onLoad, loading,
   info, error, velocity, onVelocityChange,
   warmed, warming, onWarm,
-  ccLabels, ccState, onCcChange,
+  onLoadPath, ccLabels, ccState, onCcChange,
 }) => {
   const ccEntries = Object.entries(ccLabels ?? {}).sort((a, b) => Number(a[0]) - Number(b[0]));
   const [browserOpen, setBrowserOpen] = useState(false);
@@ -40,7 +41,7 @@ export const OsmpBar: React.FC<OsmpBarProps> = ({
     <FileBrowser
       isOpen={browserOpen}
       onClose={() => setBrowserOpen(false)}
-      onSelect={(path) => { onFilePathChange(path); setBrowserOpen(false); }}
+      onSelect={(path) => { onFilePathChange(path); setBrowserOpen(false); onLoadPath?.(path); }}
       filter={['osmp']}
       title="Select OSMP Instrument"
     />
@@ -100,20 +101,21 @@ export const OsmpBar: React.FC<OsmpBarProps> = ({
         )}
       </div>
 
-      {/* CC sliders row */}
+      {/* CC sliders row — single scrollable row */}
       {info && ccEntries.length > 0 && (
-        <div className="flex items-center gap-3 px-2 pb-1 flex-wrap">
+        <div className="flex items-center gap-2 px-2 pb-1 overflow-x-auto" style={{ scrollbarWidth: 'none' }}>
+          <span className="text-[8px] font-mono text-[#1e2e2e] uppercase tracking-widest shrink-0 mr-1">CC</span>
           {ccEntries.map(([ccNum, label]) => {
             const val = ccState?.[ccNum] ?? 0;
             return (
-              <div key={ccNum} className="flex items-center gap-1.5">
-                <span className="text-[8px] font-mono text-[#2a3a3a] truncate max-w-[60px]" title={label}>{label}</span>
+              <div key={ccNum} className="flex items-center gap-1 shrink-0">
+                <span className="text-[8px] font-mono text-[#2a4040] w-[52px] truncate" title={label}>{label}</span>
                 <input
                   type="range" min={0} max={127} value={val}
                   onChange={e => onCcChange?.(Number(ccNum), Number(e.target.value))}
-                  className="w-14 h-1 accent-[#7df9ff] cursor-pointer"
+                  className="w-12 h-1 accent-[#7df9ff] cursor-pointer"
                 />
-                <span className="text-[9px] font-mono text-[#7df9ff55] w-5 tabular-nums">{val}</span>
+                <span className="text-[8px] font-mono text-[#2a5a5a] w-4 tabular-nums text-right">{val}</span>
               </div>
             );
           })}

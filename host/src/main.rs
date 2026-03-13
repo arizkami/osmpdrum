@@ -1147,7 +1147,27 @@ async fn handle_command(text: &str, state: &AppState) {
         AudioCommand::LoadOsmp { path } => {
             let tx2     = tx.clone();
             let player2 = state.osmp_player.clone();
+            let engine2 = state.engine.clone();
             tokio::task::spawn_blocking(move || {
+                // ── Free old resources BEFORE allocating the new mmap ──────────
+                // 1. Release old player (drops mmap + decode_cache)
+                {
+                    let mut g = player2.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.is_some() {
+                        println!("[LoadOsmp] dropping old OsmpPlayer");
+                        *g = None;
+                    }
+                }
+                // 2. Drain audio buffers so their Arc<Vec<f32>> refs are freed
+                if let Ok(eng) = engine2.lock() {
+                    if let Ok(mut bufs) = eng.buffers.lock() {
+                        let n = bufs.len();
+                        bufs.clear();
+                        if n > 0 { println!("[LoadOsmp] cleared {} audio buffers", n); }
+                    }
+                }
+                // ───────────────────────────────────────────────────────────────
+
                 #[derive(Serialize)]
                 struct OsmpLoadedInfo { name: String, samples: usize, zones: usize, size_mb: usize, json_len: u32 }
                 match player::OsmpPlayer::load(&path) {

@@ -1,4 +1,4 @@
-﻿import React, { useState, useRef, useEffect } from 'react';
+﻿import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Layout, Music, Settings, HelpCircle, FileAudio, Keyboard } from 'lucide-react';
 import { WaveformDisplay } from './components/WaveformDisplay';
 import { Knob } from './components/Knob';
@@ -68,6 +68,8 @@ const App: React.FC = () => {
   const [vuLevel, setVuLevel] = useState(0);
   const animationFrameRef = useRef<number>(0);
   const playStartTimeRef = useRef<number>(0);
+  const activePadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [activePadId, setActivePadId] = useState<number | null>(null);
 
   const [showProjectBrowser, setShowProjectBrowser] = useState(false);
 
@@ -292,16 +294,27 @@ const App: React.FC = () => {
     audioEngine.loadOsmp(osmpFilePath.trim());
   };
 
+  const handleOsmpLoadPath = (path: string) => {
+    setOsmpFilePath(path);
+    setOsmpLoading(true);
+    setOsmpError(null);
+    setOsmpWarmed(false);
+    audioEngine.loadOsmp(path.trim());
+  };
+
   const handleOsmpWarm = () => {
     setOsmpWarming(true);
     audioEngine.warmOsmpCache();
     setTimeout(() => { setOsmpWarming(false); setOsmpWarmed(true); }, 2500);
   };
 
-  const handleOsmpTrigger = (padId: number) => {
+  const handleOsmpTrigger = useCallback((padId: number) => {
     if (!osmpInfo) return;
     audioEngine.noteOn(padMidiNotes[padId] ?? (padId + 36), osmpVelocity);
-  };
+    if (activePadTimerRef.current) clearTimeout(activePadTimerRef.current);
+    setActivePadId(padId);
+    activePadTimerRef.current = setTimeout(() => setActivePadId(null), 180);
+  }, [osmpInfo, padMidiNotes, osmpVelocity]);
 
   const handleCcChange = (cc: number, value: number) => {
     setOsmpCcState(prev => ({ ...prev, [String(cc)]: value }));
@@ -314,6 +327,7 @@ const App: React.FC = () => {
       pads: pads.map(p => ({ id: p.id, label: p.label, filePath: p.filePath, startPoint: p.startPoint, endPoint: p.endPoint })),
       padMidiNotes,
       osmpFilePath,
+      osmpCcState,
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -349,7 +363,14 @@ const App: React.FC = () => {
         }));
       }
       if (Array.isArray(data.padMidiNotes)) setPadMidiNotes(data.padMidiNotes);
-      if (typeof data.osmpFilePath === 'string') setOsmpFilePath(data.osmpFilePath);
+      if (data.osmpCcState && typeof data.osmpCcState === 'object') {
+        const cc = data.osmpCcState as Record<string, number>;
+        setOsmpCcState(cc);
+        Object.entries(cc).forEach(([k, v]) => audioEngine.setOsmpCC(Number(k), v));
+      }
+      if (typeof data.osmpFilePath === 'string' && data.osmpFilePath.trim()) {
+        handleOsmpLoadPath(data.osmpFilePath);
+      }
       setHasUnsavedChanges(false);
     } catch (err) {
       console.error('Failed to load project:', err);
@@ -718,6 +739,8 @@ const App: React.FC = () => {
   };
 
   const selectedPad = pads[selectedPadId];
+  const selectedPadNote = padMidiNotes[selectedPadId];
+  const selectedPadZone = osmpZones?.pad_slots.find(s => s.note === selectedPadNote) ?? null;
 
   useEffect(() => {
     let raf = 0;
@@ -807,7 +830,7 @@ const App: React.FC = () => {
                 {osmpZones ? 'Zone Info' : 'Sample Properties'}
               </div>
               <OsmpPadProps
-                zone={osmpZones?.pad_slots[selectedPadId] ?? null}
+                zone={selectedPadZone}
                 padLabel={pads[selectedPadId]?.label}
               />
             </div>
@@ -837,6 +860,7 @@ const App: React.FC = () => {
                 warmed={osmpWarmed}
                 warming={osmpWarming}
                 onWarm={handleOsmpWarm}
+                onLoadPath={handleOsmpLoadPath}
                 ccLabels={osmpZones?.cc_labels}
                 ccState={osmpCcState}
                 onCcChange={handleCcChange}
@@ -847,10 +871,12 @@ const App: React.FC = () => {
                 onFileLoadToPad={handleFileLoadToPad as any} onSwapPads={handleSwapPads} onCopyPadTo={handleCopyPadTo}
                 onClearPad={handleClearPad} onPathDrop={handlePathDrop} viewMode={viewMode}
                 onToggleViewMode={() => setViewMode('drum')} padKeys={padKeys}
-                osmpBar={osmpBar} onOsmpTrigger={handleOsmpTrigger} />
+                osmpBar={osmpBar} onOsmpTrigger={handleOsmpTrigger}
+                osmpZones={osmpZones} padMidiNotes={padMidiNotes} activePadId={activePadId} />
             ) : (
               <DrumView pads={pads} onSelect={handlePadSelect} onPlay={playPad}
-                osmpBar={osmpBar} onOsmpTrigger={handleOsmpTrigger} />
+                osmpBar={osmpBar} onOsmpTrigger={handleOsmpTrigger}
+                osmpZones={osmpZones} padMidiNotes={padMidiNotes} activePadId={activePadId} />
             );
           })()}
 

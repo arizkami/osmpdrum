@@ -2,6 +2,10 @@ import React, { useState } from 'react';
 import { Copy, Trash2, FileAudio, Clipboard, ArrowLeftRight, Play } from 'lucide-react';
 import { PadData } from '../types';
 import { ContextMenu, ContextMenuItem } from './ContextMenu';
+import type { OsmpZonesData } from '../types/osmp';
+
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const noteName = (n: number) => `${NOTE_NAMES[n % 12]}${Math.floor(n / 12) - 1}`;
 
 interface PadGridProps {
     pads: PadData[];
@@ -18,6 +22,9 @@ interface PadGridProps {
     padKeys?: (string | null)[];
     osmpBar?: React.ReactNode;
     onOsmpTrigger?: (padId: number) => void;
+    osmpZones?: OsmpZonesData | null;
+    padMidiNotes?: number[];
+    activePadId?: number | null;
 }
 
 const KEY_HINTS = [
@@ -41,6 +48,9 @@ export const PadGrid: React.FC<PadGridProps> = ({
     padKeys,
     osmpBar,
     onOsmpTrigger,
+    osmpZones,
+    padMidiNotes,
+    activePadId,
 }) => {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; padId: number } | null>(null);
     const [dragOverPadId, setDragOverPadId] = useState<number | null>(null);
@@ -260,6 +270,16 @@ export const PadGrid: React.FC<PadGridProps> = ({
                                                 transition: 'opacity 0.15s, background-color 0.1s',
                                             }}
                                         >
+                                            {/* OSMP trigger flash */}
+                                            {activePadId === pad.id && (
+                                                <div className="absolute inset-0 z-20 pointer-events-none animate-ping"
+                                                    style={{ backgroundColor: row.accent + '18', borderRadius: 0 }} />
+                                            )}
+                                            {activePadId === pad.id && (
+                                                <div className="absolute inset-0 z-21 pointer-events-none"
+                                                    style={{ backgroundColor: row.accent + '22' }} />
+                                            )}
+
                                             {/* Active top accent bar */}
                                             {pad.isActive && (
                                                 <div className="absolute top-0 left-0 right-0 h-[2px] z-10"
@@ -307,43 +327,67 @@ export const PadGrid: React.FC<PadGridProps> = ({
                                             </div>
 
                                             {/* Centre content */}
-                                            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none gap-0.5">
-                                                {pad.waveformPeaks ? (
-                                                    <>
-                                                        <div className="flex items-center gap-px" style={{ height: 18 }}>
-                                                            {Array.from({ length: 16 }).map((_, i) => {
-                                                                const si = Math.floor((i / 16) * pad.waveformPeaks!.length);
-                                                                const h = Math.max(0.1, pad.waveformPeaks![si] ?? 0.1);
-                                                                return (
-                                                                    <div key={i} style={{
-                                                                        width: 2,
-                                                                        height: Math.round(h * 16) + 2,
-                                                                        borderRadius: 1,
-                                                                        backgroundColor: row.accent,
-                                                                        opacity: pad.isActive ? 0.75 : 0.28,
-                                                                    }} />
-                                                                );
-                                                            })}
+                                            {(() => {
+                                                const midiNote = padMidiNotes?.[pad.id] ?? (pad.id + 36);
+                                                const zone = osmpZones?.pad_slots.find(s => s.note === midiNote) ?? null;
+                                                const isActive = activePadId === pad.id;
+                                                return (
+                                                <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none gap-0.5">
+                                                    {pad.waveformPeaks ? (
+                                                        <>
+                                                            <div className="flex items-center gap-px" style={{ height: 18 }}>
+                                                                {Array.from({ length: 16 }).map((_, i) => {
+                                                                    const si = Math.floor((i / 16) * pad.waveformPeaks!.length);
+                                                                    const h = Math.max(0.1, pad.waveformPeaks![si] ?? 0.1);
+                                                                    return (
+                                                                        <div key={i} style={{
+                                                                            width: 2,
+                                                                            height: Math.round(h * 16) + 2,
+                                                                            borderRadius: 1,
+                                                                            backgroundColor: row.accent,
+                                                                            opacity: pad.isActive ? 0.75 : 0.28,
+                                                                        }} />
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                            {pad.label && (
+                                                                <span className="text-[8px] font-bold tracking-widest uppercase leading-none"
+                                                                    style={{ color: pad.isActive ? row.accent : row.accent + '55' }}>
+                                                                    {pad.label}
+                                                                </span>
+                                                            )}
+                                                            {pad.duration != null && pad.duration > 0 && (
+                                                                <span className="text-[7px] font-mono leading-none" style={{ color: '#303030' }}>
+                                                                    {pad.duration.toFixed(2)}s
+                                                                </span>
+                                                            )}
+                                                        </>
+                                                    ) : zone ? (
+                                                        <>
+                                                            <span className="text-[9px] font-bold tracking-widest uppercase leading-none"
+                                                                style={{ color: isActive ? row.accent : row.accent + '88' }}>
+                                                                {zone.label}
+                                                            </span>
+                                                            <span className="text-[7px] font-mono leading-none mt-0.5"
+                                                                style={{ color: isActive ? row.accent + 'aa' : '#2a4040' }}>
+                                                                {noteName(midiNote)}
+                                                            </span>
+                                                            {zone.zone_count > 1 && (
+                                                                <span className="text-[6px] font-mono leading-none"
+                                                                    style={{ color: '#1e3030' }}>
+                                                                    {zone.zone_count}L{zone.seq_length > 1 ? `·${zone.seq_length}RR` : ''}
+                                                                </span>
+                                                            )}
+                                                        </>
+                                                    ) : (
+                                                        <div className="flex flex-col items-center gap-0.5 opacity-[0.09] group-hover:opacity-[0.18] transition-opacity">
+                                                            <FileAudio size={13} strokeWidth={1.5} style={{ color: row.accent }} />
+                                                            <span className="text-[7px] font-mono tracking-wider" style={{ color: '#555' }}>EMPTY</span>
                                                         </div>
-                                                        {pad.label && (
-                                                            <span className="text-[8px] font-bold tracking-widest uppercase leading-none"
-                                                                style={{ color: pad.isActive ? row.accent : row.accent + '55' }}>
-                                                                {pad.label}
-                                                            </span>
-                                                        )}
-                                                        {pad.duration != null && pad.duration > 0 && (
-                                                            <span className="text-[7px] font-mono leading-none" style={{ color: '#303030' }}>
-                                                                {pad.duration.toFixed(2)}s
-                                                            </span>
-                                                        )}
-                                                    </>
-                                                ) : (
-                                                    <div className="flex flex-col items-center gap-0.5 opacity-[0.14] group-hover:opacity-25 transition-opacity">
-                                                        <FileAudio size={13} strokeWidth={1.5} style={{ color: row.accent }} />
-                                                        <span className="text-[7px] font-mono tracking-wider" style={{ color: '#555' }}>EMPTY</span>
-                                                    </div>
-                                                )}
-                                            </div>
+                                                    )}
+                                                </div>
+                                                );
+                                            })()}
 
                                             {/* Keyboard shortcut — bottom right */}
                                             {keyHint && (
